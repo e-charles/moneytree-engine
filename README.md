@@ -1,16 +1,13 @@
-# myfolio
+# moneytree optimizer and generator
 
-Code is adapted from tradingview by dev named (Julien_Eche)... my version is the 
-translation from pine to python with the help of grok since I do not have a deep knowledge 
-of pine
+Optimizer/backtester is adapted from tradingview by dev named (Julien_Eche)..
 
 Libraries: 
     pip install yfinance pandas numpy ta
     
 Overview:
-    the code evales a trading strategy based on SMA crossovers (buys when price crosses above SMA), 
-    sell (when it crosses below). It calcs total trades, profit factor, win rate, robustness score to 
-    identify the optimal SMA length 
+    The code evales a different trading strategy based on SMA and RSI indicators. Optimizer calcs total trades, profit factor, win rate, robustness score to identify the optimal strategy amd strategy params. 
+    This could be used to then generate live signals for a stock.  
 
 Key comp:
     1. Data fetching: uses yfiance to download historical stock data 
