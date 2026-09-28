@@ -1,4 +1,9 @@
 import pandas as pd
+import sys
+from pathlib import Path
+
+# Adds the parent directory (/workspaces/moneytree-optimizer) to the path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from strats.double_dip import rsi_double_dip_targets
 
@@ -83,3 +88,18 @@ def test_target_is_shifted_for_next_open_execution() -> None:
     expected = pd.Series([0, 0, 0, 1], dtype="int8")
 
     pd.testing.assert_series_equal(executable_target, expected)
+
+def test_consecutive_oversold_bars_count_as_one_episode() -> None:
+    rsi = pd.Series(
+        [50, 29, 28, 27, 25, 23, 29, 31, 45],
+        dtype=float,
+    )
+
+    actual = rsi_double_dip_targets(
+        rsi=rsi,
+        oversold=30,
+        overbought=70,
+        max_bars_between_dips=10,
+    )
+
+    assert actual.eq(0).all()
