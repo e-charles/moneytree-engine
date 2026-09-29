@@ -1,4 +1,4 @@
-# src/trading_research/metrics.py
+# backtesting/metrics.py
 
 from __future__ import annotations
 
@@ -11,22 +11,86 @@ def calculate_metrics(
     trades: pd.DataFrame,
     periods_per_year: int = 252,
 ) -> dict[str, float]:
+    """
+    Calculate performance statistics from a backtest.
+
+    Parameters
+    ----------
+    equity:
+    Portfolio equity measured at each bar's Close.
+
+    trades:
+    DataFrame containing completed trades produced by
+    the backtesting engine.
+
+    periods_per_year:
+    Number of observations expected per year.
+    252 is appropriate for daily U.S. equity data.
+
+    Notes
+    -----
+    Sharpe ratio assumes a zero risk-free rate.
+
+    Maximum drawdown is returned as a negative number.
+    Example:
+    -0.20 means a 20% maximum drawdown.
+    """
+
+    # ---------------------------------------------------------
+    # Validation
+    # ---------------------------------------------------------
+
     if equity.empty:
         raise ValueError("equity cannot be empty")
 
-    returns = equity.pct_change().dropna()
-    total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
+    if periods_per_year <= 0:
+        raise ValueError("periods_per_year must be greater than zero")
 
-    years = len(equity) / periods_per_year
+    if (equity.isna().any()):
+        raise ValueError("equity ccannot contain NaN values")
+
+    if (equity <= 0).any():
+        raise ValueError("equity values must be greater than zero")
+
+    required_trade_cols = {"net_pnl"}
+
+    missing = required_trade_cols.difference( trades.columns)
+
+    if missing and not trades.empty:
+        raise ValueError(f"Missing required trade columns: {sorted(missing)}")
+
+    # ---------------------------------------------------------
+    # Portfolio return
+    # ---------------------------------------------------------
+
+    returns = equity.pct_change().dropna()
+
+    starting_equity = float(equity.iloc[0]) # assumption that equity.iloc[0] == the intial_cash 
+    ending_equity = float(equity.iloc[-1])
+
+    total_return = ending_equity / starting_equity - 1.0 
+
+    # ---------------------------------------------------------
+    # Annualized return
+    # ---------------------------------------------------------
+    years = len(returns) / periods_per_year
     annualized_return = (
-        (equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1
-        if years > 0 and equity.iloc[0] > 0
+        (ending_equity / starting_equity) ** (1 / years) - 1
+        if years > 0 and starting_equity > 0
         else np.nan
     )
+
+    # ---------------------------------------------------------
+    # Drawdown
+    # ---------------------------------------------------------
 
     running_peak = equity.cummax()
     drawdown = equity / running_peak - 1.0
     max_drawdown = float(drawdown.min())
+
+    # ---------------------------------------------------------
+    # Volatility and Sharpe
+    # ---------------------------------------------------------
 
     volatility = returns.std(ddof=1) * np.sqrt(periods_per_year)
     sharpe = (
@@ -35,10 +99,14 @@ def calculate_metrics(
         else np.nan
     )
 
+    # ---------------------------------------------------------
+    # No completed trades
+    # ---------------------------------------------------------
     if trades.empty:
         return {
             "total_return": float(total_return),
             "annualized_return": float(annualized_return),
+            "annualized_volatility": float(volatility), 
             "max_drawdown": max_drawdown,
             "sharpe": float(sharpe),
             "closed_trades": 0,
@@ -47,6 +115,9 @@ def calculate_metrics(
             "net_profit": 0.0,
         }
 
+    # ---------------------------------------------------------
+    # Trade Stats
+    # ---------------------------------------------------------
     pnl = trades["net_pnl"]
     gross_profit = float(pnl[pnl > 0].sum())
     gross_loss = float(-pnl[pnl < 0].sum())
@@ -60,6 +131,9 @@ def calculate_metrics(
     return {
         "total_return": float(total_return),
         "annualized_return": float(annualized_return),
+        "annualized_volitilty": float(volatility), 
+        "gross_profit": gross_profit, 
+        "gross_loss": gross_loss,
         "max_drawdown": max_drawdown,
         "sharpe": float(sharpe),
         "closed_trades": int(len(trades)),

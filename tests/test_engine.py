@@ -394,23 +394,184 @@ def test_target_exit_records_completed_trade() -> None:
 
 
 
-# def test_forced_final_liquidation_records_completed_trade() -> None:
+def test_forced_final_liquidation_records_completed_trade() -> None:
+    data = make_data(
+            opens=[100.0, 110.0, 120.0],
+            closes=[100.0, 115.0, 125.0],
+    )
+    
+    target_at_close = make_target(data, [1, 1, 1])
 
-# def test_forced_liquidation_has_exit_reason_eq_end_of_data() -> None:
+    # Enter at bar 1; exit at bar 3.
+    result = run_backtest(
+        data,
+        target_at_close,
+        no_cost_config(close_open_position_at_end=True)
+    )
+
+    assert len(result.trades) == 1
+
+    trade = result.trades.iloc[0]
+
+    # entry is at open bar 1 
+    assert trade["entry_time"] == data.index[1]
+    assert trade["exit_price"] == pytest.approx(125.0)
+
+    units = 100_000.0 / 110.0
+    expected_pnl = ( (125.0 - 110.0) * units)
+
+    assert trade["net_pnl"] == pytest.approx(expected_pnl)
+    assert result.equity.iloc[-1] == pytest.approx( 100_000.0 + expected_pnl)
+
+    assert result.positions.iloc[-1] == 0 
 
 
-# # Validation 
-# def test_empty_data_rejected() -> None:
+def test_forced_liquidation_has_exit_reason_equal_to_end_of_data() -> None:
+    data = make_data(
+            opens=[100.0, 110.0, 120.0],
+            closes=[100.0, 115.0, 125.0],
+    )
+    
+    target_at_close = make_target(data, [1, 1, 1])
 
-# def test_missing_open_rejected() -> None: 
+    # Enter at bar 1; exit at bar 3.
+    result = run_backtest(
+        data,
+        target_at_close,
+        no_cost_config(close_open_position_at_end=True)
+    )
 
-# def test_missing_close_rejected() -> None: 
+    assert len(result.trades) == 1
 
-# def test_negative_or_zero_prices_rejected() -> None:
+    trade = result.trades.iloc[0]
 
-# def test_nan_prices_rejected() -> None:
+    assert trade["exit_reason"] == "end_of_data"
 
-# def test_invalid_target_rejected() -> None:
 
-# def test_target_or_data_index_mismatch_rejected() -> None:
+# Validation 
+def test_empty_data_rejected() -> None:
+    data = pd.DataFrame(
+        columns=["Open", "Close"],
+        dtype=float
+    )
 
+    target_at_close = pd.Series([], index= data.index, dtype="int8")
+
+    with pytest.raises(
+        ValueError, 
+        match="data cannot be empty"
+    ): run_backtest(data, target_at_close)
+
+def test_missing_open_rejected() -> None: 
+    index = pd.date_range(
+        "2025-01-01",
+        periods=3,
+        freq="D"
+    )
+
+    data = pd.DataFrame(
+        {
+            "Close": [100.0, 101.0, 102.0]
+        },
+        index=index,
+    )
+
+    target_at_close = pd.Series(
+        [0, 0, 0],
+        index=index, 
+        dtype="int8"
+    )
+
+    with pytest.raises(
+        ValueError, 
+        match="Missing required columns"
+    ): run_backtest(
+        data, 
+        target_at_close
+    )
+
+def test_missing_close_rejected() -> None: 
+    data = make_data(
+        opens=[100.0, 0.0, 100.0],
+        closes=[100.0, 100.0, 100.0],
+    )
+    
+    target_at_close = make_target(data, [0, 0, 0])
+
+    with pytest.raises(
+        ValueError, 
+        match= "Open and Close prices must be greater than zero",
+    ): run_backtest(
+        data,
+        target_at_close,
+    )
+
+def test_negative_or_zero_prices_rejected() -> None:
+    data = make_data(
+        opens=[100.0, -5.0, 100.0],
+        closes=[100.0, 100.0, 100.0],
+    )
+    
+    target_at_close = make_target(data, [0, 0, 0])
+
+    with pytest.raises(
+        ValueError, 
+        match= "Open and Close prices must be greater than zero",
+    ): run_backtest(
+        data,
+        target_at_close,
+    )
+
+def test_nan_prices_rejected() -> None:
+    data = make_data(
+        opens=[100.0, float("nan"), 100.0],
+        closes=[100.0, 105.0, 115.0],
+    )
+    
+    target_at_close = make_target(data, [0, 0, 0])
+
+    with pytest.raises(
+        ValueError, 
+        match= "Open and Close prices cannot contain NaN values",
+    ): run_backtest(
+        data,
+        target_at_close,
+    )
+
+def test_invalid_target_rejected() -> None:
+    data = make_data(
+        opens=[100.0, 101.0, 102.0],
+        closes=[100.0, 101.0, 102.0],
+    )
+    
+    target_at_close = make_target(data, [0, 2, 0])
+
+    with pytest.raises(
+        ValueError, 
+        match= "target_at_close may contain only 0 or 1",
+    ): run_backtest(
+        data,
+        target_at_close,
+    )
+
+def test_target_or_data_index_mismatch_rejected() -> None:
+    data = make_data(
+        opens=[100.0, 101.0, 102.0],
+        closes=[100.0, 101.0, 102.0],
+    )
+
+    wrong_index = pd.date_range(
+        "2030-01-01",
+        periods=3,
+        freq="D"
+    )
+    
+    target_at_close = pd.Series([0, 1, 1], index=wrong_index, dtype="int8")
+
+    with pytest.raises(
+        ValueError, 
+        match= "target_at_close index must exactly match data index",
+    ): run_backtest(
+        data,
+        target_at_close,
+    )
