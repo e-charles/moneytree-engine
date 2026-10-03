@@ -1,9 +1,9 @@
 import pandas as pd
-import sys
-from pathlib import Path
+# import sys
+# from pathlib import Path
 
 # Adds the parent directory (/workspaces/moneytree-optimizer) to the path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from strats.double_dip import rsi_double_dip_targets
 

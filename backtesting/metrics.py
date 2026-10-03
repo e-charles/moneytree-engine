@@ -47,7 +47,7 @@ def calculate_metrics(
         raise ValueError("periods_per_year must be greater than zero")
 
     if (equity.isna().any()):
-        raise ValueError("equity ccannot contain NaN values")
+        raise ValueError("equity cannot contain NaN values")
 
     if (equity <= 0).any():
         raise ValueError("equity values must be greater than zero")
@@ -109,18 +109,36 @@ def calculate_metrics(
             "annualized_volatility": float(volatility), 
             "max_drawdown": max_drawdown,
             "sharpe": float(sharpe),
+
             "closed_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+
             "win_rate": np.nan,
+
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
             "profit_factor": np.nan,
+
             "net_profit": 0.0,
+            "average_trade_return": np.nan
         }
 
     # ---------------------------------------------------------
     # Trade Stats
     # ---------------------------------------------------------
     pnl = trades["net_pnl"]
+    net_profit = float( pnl.sum())
+    winning_trades = int( (pnl > 0).sum())
+    losing_trades = int( (pnl < 0).sum())
     gross_profit = float(pnl[pnl > 0].sum())
     gross_loss = float(-pnl[pnl < 0].sum())
+
+    average_trade_return = (
+        float(trades["return_pct"].mean())
+        if "return_pct" in trades.columns
+        else np.nan
+    )
 
     profit_factor = (
         gross_profit / gross_loss
@@ -131,13 +149,20 @@ def calculate_metrics(
     return {
         "total_return": float(total_return),
         "annualized_return": float(annualized_return),
-        "annualized_volitilty": float(volatility), 
-        "gross_profit": gross_profit, 
-        "gross_loss": gross_loss,
+        "annualized_volatility": float(volatility), 
         "max_drawdown": max_drawdown,
         "sharpe": float(sharpe),
+
         "closed_trades": int(len(trades)),
+        "winning_trades": winning_trades,
+        "losing_trades": losing_trades,
+
         "win_rate": float((pnl > 0).mean()),
+
+        "gross_profit": gross_profit, 
+        "gross_loss": gross_loss,
         "profit_factor": float(profit_factor),
-        "net_profit": float(pnl.sum()),
+
+        "net_profit": net_profit,
+        "average_trade_return": average_trade_return
     }
