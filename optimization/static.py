@@ -73,26 +73,15 @@ def _calculate_rsi(
     ).rsi()
 
 
-def evaluate_double_dip_candidate(
+def evaluate_double_dip_candidate_from_rsi(
     data: pd.DataFrame,
+    rsi: pd.Series,
     parameters: DoubleDipParameters,
     backtest_config: BacktestConfig | None = None,
     periods_per_year: int = 252,
 ) -> dict[str, float | int]:
     """
-    Evaluate one RSI Double Dip parameter configuration.
-
-    Pipeline:
-
-        market data
-            ↓
-        RSI
-            ↓
-        Double Dip targets
-            ↓
-        backtest engine
-            ↓
-        metrics
+    Evaluate one Double Dip parameter configuration using an already-calculated RSI series
 
     Returns one flat dictionary suitable for conversion
     into a DataFrame row.
@@ -100,15 +89,6 @@ def evaluate_double_dip_candidate(
 
     if backtest_config is None:
         backtest_config = BacktestConfig()
-
-    # ---------------------------------------------------------
-    # RSI
-    # ---------------------------------------------------------
-
-    rsi = _calculate_rsi(
-        close=data["Close"],
-        rsi_length=parameters.rsi_length,
-    )
 
     # ---------------------------------------------------------
     # Strategy
@@ -154,33 +134,9 @@ def evaluate_double_dip_candidate(
         "max_bars_between_dips": (
             parameters.max_bars_between_dips
         ),
-
-        "total_return": metrics["total_return"],
-        "annualized_return": metrics["annualized_return"],
-        "max_drawdown": metrics["max_drawdown"],
-        "annualized_volatility": (
-            metrics["annualized_volatility"]
-        ),
-        "sharpe": metrics["sharpe"],
-
-        "closed_trades": metrics["closed_trades"],
-        "winning_trades": metrics["winning_trades"],
-        "losing_trades": metrics["losing_trades"],
-
-        "win_rate": metrics["win_rate"],
-
-        "gross_profit": metrics["gross_profit"],
-        "gross_loss": metrics["gross_loss"],
-        "profit_factor": metrics["profit_factor"],
-
-        "net_profit": metrics["net_profit"],
-        "average_trade_return": (
-            metrics["average_trade_return"]
-        ),
-
-        # Useful diagnostic columns.
+        **metrics, # should destructire metrics
         "final_equity": float(
-            result.equity.iloc[-1]
+        result.equity.iloc[-1]
         ),
     }
 
@@ -202,7 +158,109 @@ def optimize_double_dip(
     selection can be handled independently.
     """
 
+    # ---------------------------------------------------------
+    # 1. Validate market data
+    # ---------------------------------------------------------
+
     _validate_market_data(data)
 
+    if periods_per_year <= 0:
+        raise ValueError(
+            "periods_per_year must be greater than zero"
+        )
+
     if backtest_config is None:
-        backtest_config = BacktestConfig
+        backtest_config = BacktestConfig()
+
+    # ---------------------------------------------------------
+    # 2. Generate every valid candidate
+    # ---------------------------------------------------------
+
+    candidates = list(search_space.candidates())
+
+    if not candidates:
+        raise ValueError(
+            "search_space produced no valid candidates"
+        )
+
+    # ---------------------------------------------------------
+    # 3. Find the unique RSI lengths
+    # ---------------------------------------------------------
+    #
+    # Many candidates share the same RSI length.
+    #
+    # Example:
+    #
+    # RSI 14 / OS 25 / OB 70 / Gap 5
+    # RSI 14 / OS 30 / OB 70 / Gap 5
+    # RSI 14 / OS 30 / OB 75 / Gap 10
+    #
+    # All three use exactly the same RSI(14) series.
+    #
+    # Therefore, calculate RSI(14) once rather than three times.
+    # ---------------------------------------------------------
+
+    unique_rsi_lengths = sorted(
+        {
+            candidate.rsi_length
+            for candidate in candidates
+        }
+    )
+
+    # ---------------------------------------------------------
+    # 4. Build RSI cache
+    # ---------------------------------------------------------
+
+    rsi_cache: dict[int, pd.Series] = {}
+
+    for rsi_length in unique_rsi_lengths:
+        rsi_cache[rsi_length] = _calculate_rsi(
+            close=data["Close"],
+            rsi_length=rsi_length,
+        )
+
+    # ---------------------------------------------------------
+    # 5. Evaluate every candidate
+    # ---------------------------------------------------------
+
+    rows: list[dict[str, float | int]] = []
+
+    for parameters in candidates:
+
+        # Retrieve the already-calculated RSI series.
+        rsi = rsi_cache[
+            parameters.rsi_length
+        ]
+
+        row = evaluate_double_dip_candidate_from_rsi(
+            data=data,
+            rsi=rsi,
+            parameters=parameters,
+            backtest_config=backtest_config,
+            periods_per_year=periods_per_year,
+        )
+
+        rows.append(row)
+
+    # ---------------------------------------------------------
+    # 6. Convert all candidate results into a DataFrame
+    # ---------------------------------------------------------
+
+    results = pd.DataFrame(rows)
+
+    # ---------------------------------------------------------
+    # 7. Return RAW optimization results
+    # ---------------------------------------------------------
+    #
+    # Do NOT:
+    #
+    # - sort by Sharpe
+    # - pick highest return
+    # - remove low-trade candidates
+    # - replace infinite profit factors
+    # - select a winner
+    #
+    # Those responsibilities belong to selection.py.
+    # ---------------------------------------------------------
+
+    return results
