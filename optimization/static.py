@@ -9,7 +9,7 @@ from ta.momentum import RSIIndicator
 
 from strats.double_dip import rsi_double_dip_targets
 
-from backtesting.engine import BacktestConfig, run_backtest
+from backtesting.engine import BacktestConfig, run_backtest, validate_backtest_config, validate_backtest_market_data
 
 from backtesting.metrics import calculate_metrics
 
@@ -79,6 +79,7 @@ def evaluate_double_dip_candidate_from_rsi(
     parameters: DoubleDipParameters,
     backtest_config: BacktestConfig | None = None,
     periods_per_year: int = 252,
+    inputs_prevalidated: bool = False
 ) -> dict[str, float | int]:
     """
     Evaluate one Double Dip parameter configuration using an already-calculated RSI series
@@ -111,6 +112,7 @@ def evaluate_double_dip_candidate_from_rsi(
         data=data,
         target_at_close=target_at_close,
         config=backtest_config,
+        inputs_prevalidated=inputs_prevalidated
     )
 
     # ---------------------------------------------------------
@@ -164,6 +166,8 @@ def optimize_double_dip(
 
     _validate_market_data(data)
 
+    
+
     if periods_per_year <= 0:
         raise ValueError(
             "periods_per_year must be greater than zero"
@@ -171,6 +175,8 @@ def optimize_double_dip(
 
     if backtest_config is None:
         backtest_config = BacktestConfig()
+
+    validate_backtest_config(backtest_config)
 
     # ---------------------------------------------------------
     # 2. Generate every valid candidate
@@ -238,6 +244,7 @@ def optimize_double_dip(
             parameters=parameters,
             backtest_config=backtest_config,
             periods_per_year=periods_per_year,
+            inputs_prevalidated=True
         )
 
         rows.append(row)

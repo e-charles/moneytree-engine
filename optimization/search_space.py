@@ -1,4 +1,4 @@
-# src/trading_research/optimization/search_space.py
+# /optimization/search_space.py
 
 from __future__ import annotations
 

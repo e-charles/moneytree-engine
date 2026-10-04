@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,15 @@ PARAMETER_COLUMNS = (
 )
 
 
+ParameterValue = float | int
+ParameterKey = tuple[
+    ParameterValue,
+    ParameterValue,
+    ParameterValue,
+    ParameterValue,
+]
+
+
 @dataclass(frozen=True)
 class NeighborhoodConfig:
     """
@@ -24,35 +34,32 @@ class NeighborhoodConfig:
     metric:
         Performance metric used to evaluate the neighborhood.
 
-        Sharpe is the recommended initial choice because this
-        robustness layer is intended to measure whether nearby
-        parameter configurations have reasonably similar
-        risk-adjusted behavior.
-
     min_neighbors:
-        Minimum number of neighboring configurations required
-        before neighborhood robustness is considered valid.
+        Minimum number of valid neighboring configurations
+        required before neighborhood robustness is considered
+        valid.
 
     relative_performance_floor:
-        A neighbor is considered "healthy" when its metric is at
+        A neighbor is considered healthy when its metric is at
         least this fraction of the center candidate's metric.
 
         Example:
+
             center Sharpe = 1.50
             floor = 0.75
 
-            healthy neighbor threshold = 1.125
+            threshold = 1.125
 
     include_diagonal_neighbors:
-        If False, only candidates differing in exactly one
-        parameter dimension are considered neighbors.
+        If False, neighbors differ by exactly one grid step
+        along exactly one parameter dimension.
 
-        If True, candidates may differ by one grid step across
+        If True, neighbors may differ by one grid step across
         multiple parameter dimensions simultaneously.
 
     require_positive_neighbor_metric:
-        Prevents negative-performance neighbors from contributing
-        positively to robustness.
+        If True, only positive neighboring metric values are
+        considered valid.
     """
 
     metric: str = "sharpe"
@@ -66,12 +73,17 @@ class NeighborhoodConfig:
     require_positive_neighbor_metric: bool = True
 
     def __post_init__(self) -> None:
+
         if self.min_neighbors < 1:
             raise ValueError(
                 "min_neighbors must be at least 1"
             )
 
-        if not 0 < self.relative_performance_floor <= 1:
+        if not (
+            0
+            < self.relative_performance_floor
+            <= 1
+        ):
             raise ValueError(
                 "relative_performance_floor must be "
                 "greater than 0 and less than or equal to 1"
@@ -83,7 +95,8 @@ def _validate_results(
     config: NeighborhoodConfig,
 ) -> None:
     """
-    Validate static optimizer results before neighborhood analysis.
+    Validate static optimizer results before neighborhood
+    analysis.
     """
 
     if results.empty:
@@ -101,169 +114,345 @@ def _validate_results(
     )
 
     if missing:
-      raise ValueError(
-         "Missing required optimization columns: "
+        raise ValueError(
+            "Missing required optimization columns: "
             f"{sorted(missing)}"
         )
 
     if results.duplicated(
         subset=list(PARAMETER_COLUMNS)
     ).any():
-       raise ValueError(
-            "opt*mization results contain duplicate*"
-            "parameter configura*ions"
+        raise ValueError(
+            "optimization results contain duplicate "
+            "parameter configurations"
         )
 
 
 def _ordered_parameter_values(
     results: pd.DataFrame,
-) -> dict[str, list[float | int]]:
+) -> dict[str, list[ParameterValue]]:
     """
-    Extract the ordered parameter grid represented by the
-    optimizer result table.
+    Extract the ordered values represented along each
+    parameter dimension.
+
+    Grid adjacency is based on position in these lists rather
+    than numerical distance.
     """
 
     return {
         column: sorted(
-            results[column].dropna().unique().tolist()
+            results[
+                column
+            ].dropna().unique().tolist()
         )
         for column in PARAMETER_COLUMNS
     }
 
 
 def _parameter_grid_positions(
-    values: dict[str, list[float | int]],
-) -> dict[str, dict[float | int, int]]:
+    values: dict[str, list[ParameterValue]],
+) -> dict[str, dict[ParameterValue, int]]:
     """
-    Map each parameter value to its location on the search grid.
+    Map each parameter value to its position on its grid axis.
 
     Example:
 
-        rsi_length:
-            5  -> position 0
-            8  -> position 1
-            14 -> position 2
+        rsi_length = [5, 8, 14]
 
-    Neighborhood distance is based on grid position rather than
-    numeric distance.
+    becomes:
 
-    This matters because search spaces do not necessarily use
-    evenly spaced parameter values.
+        {
+            5: 0,
+            8: 1,
+            14: 2,
+        }
+
+    This allows unevenly spaced parameter grids while still
+    treating adjacent choices as one grid step apart.
     """
 
     return {
         column: {
             value: position
-            for position, value in enumerate(column_values)
+            for position, value
+            in enumerate(column_values)
         }
-        for column, column_values in values.items()
+        for column, column_values
+        in values.items()
     }
 
 
-def _grid_distance(
-    candidate: pd.Series,
-    neighbor: pd.Series,
-    positions: dict[str, dict[float | int, int]],
-) -> tuple[int, int]:
+def _build_candidate_lookup(
+    results: pd.DataFrame,
+) -> dict[ParameterKey, int]:
     """
-    Calculate grid distance between two parameter configurations.
+    Build direct lookup from a complete parameter configuration
+    to its row index.
 
-    Returns:
-        (maximum_axis_distance, changed_dimensions)
+    Example:
 
-    maximum_axis_distance:
-        Largest number of grid steps separating the candidates
-        along any one parameter.
-
-    changed_dimensions:
-        Number of parameter dimensions that differ.
-    """
-
-    distances = []
-
-    for column in PARAMETER_COLUMNS:
-        candidate_position = positions[column][
-            candidate[column]
-        ]
-
-        neighbor_position = positions[column][
-            neighbor[column]
-        ]
-
-        distances.append(
-            abs(
-                candidate_position
-                - neighbor_position
-            )
+        (
+            14,
+            30.0,
+            70.0,
+            5,
         )
 
-    maximum_axis_distance = max(distances)
+    maps directly to the optimizer-result row containing that
+    configuration.
+    """
 
-    changed_dimensions = sum(
-        distance > 0
-        for distance in distances
+    lookup: dict[ParameterKey, int] = {}
+
+    for row_index, row in results.iterrows():
+
+        key: ParameterKey = (
+            row["rsi_length"],
+            row["oversold"],
+            row["overbought"],
+            row["max_bars_between_dips"],
+        )
+
+        lookup[key] = row_index
+
+    return lookup
+
+
+def _neighbor_axis_values(
+    column: str,
+    value: ParameterValue,
+    values: dict[str, list[ParameterValue]],
+    positions: dict[
+        str,
+        dict[ParameterValue, int],
+    ],
+) -> list:
+    """
+    Return the center value plus its immediate previous and next
+    values along one grid dimension.
+
+    Example:
+
+        values:
+            [5, 8, 14, 21]
+
+        center:
+            14
+
+        returns:
+            [14, 8, 21]
+
+    At a boundary:
+
+        center:
+            5
+
+        returns:
+            [5, 8]
+    """
+
+    axis_values = values[column]
+
+    center_position = positions[column][
+        value
+    ]
+
+    choices: list[ParameterValue] = [
+        value
+    ]
+
+    previous_position = (
+        center_position - 1
     )
 
-    return (
-        maximum_axis_distance,
-        changed_dimensions,
+    next_position = (
+        center_position + 1
     )
+
+    if previous_position >= 0:
+        choices.append(
+            axis_values[
+                previous_position
+            ]
+        )
+
+    if next_position < len(axis_values):
+        choices.append(
+            axis_values[
+                next_position
+            ]
+        )
+
+    return choices
 
 
 def _find_neighbor_indices(
-    results: pd.DataFrame,
-    row_index: int,
-    positions: dict[str, dict[float | int, int]],
+    candidate: pd.Series,
+    values: dict[str, list[ParameterValue]],
+    positions: dict[
+        str,
+        dict[ParameterValue, int],
+    ],
+    candidate_lookup: dict[ParameterKey, int],
     include_diagonal_neighbors: bool,
-) -> list[int]:
+) -> list:
     """
-    Find immediate neighbors of one candidate.
+    Find immediate parameter-grid neighbors using direct
+    dictionary lookup.
 
-    A direct neighbor differs by exactly one search-grid step.
+    This avoids comparing the candidate against every row in
+    the optimizer result table.
 
-    By default, only one parameter may change at a time.
+    Direct-neighbor mode:
+        Exactly one parameter differs by one grid step.
 
-    Example direct neighbors:
-
-        RSI 12 -> RSI 11
-        RSI 12 -> RSI 13
-
-        oversold 30 -> 25
-        oversold 30 -> 35
-
-    Diagonal neighbors may differ by one grid step in more than
-    one parameter simultaneously.
+    Diagonal-neighbor mode:
+        One or more parameters may differ by one grid step,
+        while no parameter may differ by more than one step.
     """
 
-    candidate = results.loc[row_index]
+    center_key: ParameterKey = (
+        candidate["rsi_length"],
+        candidate["oversold"],
+        candidate["overbought"],
+        candidate["max_bars_between_dips"],
+    )
 
-    neighbor_indices: list[int] = []
+    # ---------------------------------------------------------
+    # FAST PATH: axis-aligned neighbors only
+    # ---------------------------------------------------------
+    #
+    # Four dimensions means at most:
+    #
+    #     4 × 2 = 8
+    #
+    # possible direct neighbors.
+    # ---------------------------------------------------------
 
-    for other_index, other in results.iterrows():
-        if other_index == row_index:
-            continue
+    if not include_diagonal_neighbors:
 
-        (
-            maximum_axis_distance,
-            changed_dimensions,
-        ) = _grid_distance(
-            candidate=candidate,
-            neighbor=other,
+        neighbor_indices: list[int] = []
+
+        for dimension, column in enumerate(
+            PARAMETER_COLUMNS
+        ):
+            current_value = center_key[
+                dimension
+            ]
+
+            current_position = positions[
+                column
+            ][current_value]
+
+            axis_values = values[
+                column
+            ]
+
+            for offset in (-1, 1):
+
+                neighbor_position = (
+                    current_position + offset
+                )
+
+                if not (
+                    0
+                    <= neighbor_position
+                    < len(axis_values)
+                ):
+                    continue
+
+                neighbor_key_list = list(
+                    center_key
+                )
+
+                neighbor_key_list[
+                    dimension
+                ] = axis_values[
+                    neighbor_position
+                ]
+
+                neighbor_key: ParameterKey = tuple(
+                    neighbor_key_list
+                )
+
+                neighbor_index = (
+                    candidate_lookup.get(
+                        neighbor_key
+                    )
+                )
+
+                # A theoretical grid neighbor may not actually
+                # exist in the result table.
+                #
+                # Example:
+                #
+                # oversold >= overbought combinations are
+                # excluded by the Double Dip search space.
+                if neighbor_index is not None:
+                    neighbor_indices.append(
+                        neighbor_index
+                    )
+
+        return neighbor_indices
+
+    # ---------------------------------------------------------
+    # DIAGONAL MODE
+    # ---------------------------------------------------------
+    #
+    # Build the set of:
+    #
+    #     previous / center / next
+    #
+    # values along each dimension, then generate their Cartesian
+    # product.
+    #
+    # With four dimensions there are at most:
+    #
+    #     3^4 - 1 = 80
+    #
+    # possible immediate neighbors.
+    #
+    # That is still far smaller than scanning all 2,080
+    # candidates.
+    # ---------------------------------------------------------
+
+    axis_choices = [
+        _neighbor_axis_values(
+            column=column,
+            value=candidate[column],
+            values=values,
             positions=positions,
         )
+        for column in PARAMETER_COLUMNS
+    ]
 
-        # Must be one immediate grid step away.
-        if maximum_axis_distance != 1:
+    neighbor_indices = []
+
+    for combination in product(
+        *axis_choices
+    ):
+
+        neighbor_key: ParameterKey = (
+            combination[0],
+            combination[1],
+            combination[2],
+            combination[3],
+        )
+
+        # Exclude the center candidate itself.
+        if neighbor_key == center_key:
             continue
 
-        if include_diagonal_neighbors:
-            if changed_dimensions >= 1:
-                neighbor_indices.append(other_index)
+        neighbor_index = (
+            candidate_lookup.get(
+                neighbor_key
+            )
+        )
 
-        else:
-            # Direct axis-aligned neighbor.
-            if changed_dimensions == 1:
-                neighbor_indices.append(other_index)
+        if neighbor_index is not None:
+            neighbor_indices.append(
+                neighbor_index
+            )
 
     return neighbor_indices
 
@@ -280,50 +469,51 @@ def add_neighborhood_robustness(
 
     Added columns
     -------------
+
     neighbor_count:
-        Number of immediate parameter-grid neighbors.
+        Number of immediate parameter-grid neighbors that exist.
 
     valid_neighbor_count:
-        Number of neighbors with a finite, usable metric.
+        Number of neighbors with a usable metric.
 
     neighbor_metric_mean:
-        Average metric across valid neighbors.
+        Mean metric across valid neighboring configurations.
 
     neighbor_metric_median:
-        Median metric across valid neighbors.
+        Median metric across valid neighboring configurations.
 
     neighbor_metric_min:
         Worst valid neighboring metric.
 
     neighbor_metric_std:
-        Standard deviation of neighboring performance.
+        Population standard deviation across valid neighboring
+        metrics.
 
     healthy_neighbor_count:
-        Number of neighbors achieving at least
-        relative_performance_floor * center metric.
+        Number of valid neighbors achieving at least:
+
+            center metric
+            *
+            relative_performance_floor
 
     healthy_neighbor_fraction:
         Fraction of valid neighbors considered healthy.
 
     neighborhood_ratio:
         Median neighboring performance divided by center
-        candidate performance.
-
-        Values near 1 indicate nearby configurations perform
-        comparably to the center.
+        performance.
 
     neighborhood_robustness:
-        Combined robustness statistic.
-
-        For positive center metrics:
+        Combined robustness score:
 
             healthy_neighbor_fraction
             *
             clipped neighborhood_ratio
 
-        Scores lie between 0 and 1.
+        The score lies between 0 and 1.
 
-        A candidate receives NaN if insufficient neighbors exist.
+        NaN means there was insufficient information to assess
+        robustness.
     """
 
     if config is None:
@@ -334,9 +524,16 @@ def add_neighborhood_robustness(
         config=config,
     )
 
-    output = results.copy().reset_index(
-        drop=True
+    # Reset index so dictionary lookup and iloc-style candidate
+    # relationships remain simple and predictable.
+    output = (
+        results.copy()
+        .reset_index(drop=True)
     )
+
+    # ---------------------------------------------------------
+    # Precompute grid structures ONCE
+    # ---------------------------------------------------------
 
     values = _ordered_parameter_values(
         output
@@ -345,6 +542,16 @@ def add_neighborhood_robustness(
     positions = _parameter_grid_positions(
         values
     )
+
+    candidate_lookup = (
+        _build_candidate_lookup(
+            output
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Result containers
+    # ---------------------------------------------------------
 
     neighbor_counts: list[int] = []
     valid_neighbor_counts: list[int] = []
@@ -362,22 +569,32 @@ def add_neighborhood_robustness(
 
     metric = config.metric
 
+    # ---------------------------------------------------------
+    # Evaluate neighborhood around every candidate
+    # ---------------------------------------------------------
+
     for row_index in output.index:
 
+        candidate = output.loc[
+            row_index
+        ]
+
         center_metric = float(
-            output.loc[
-                row_index,
-                metric,
-            ]
+            candidate[metric]
         )
 
-        neighbor_indices = _find_neighbor_indices(
-            results=output,
-            row_index=row_index,
-            positions=positions,
-            include_diagonal_neighbors=(
-                config.include_diagonal_neighbors
-            ),
+        neighbor_indices = (
+            _find_neighbor_indices(
+                candidate=candidate,
+                values=values,
+                positions=positions,
+                candidate_lookup=(
+                    candidate_lookup
+                ),
+                include_diagonal_neighbors=(
+                    config.include_diagonal_neighbors
+                ),
+            )
         )
 
         neighbor_count = len(
@@ -388,26 +605,39 @@ def add_neighborhood_robustness(
             neighbor_count
         )
 
-        neighbor_metrics = output.loc[
-            neighbor_indices,
-            metric,
-        ].astype(float)
+        # -----------------------------------------------------
+        # Neighbor performance
+        # -----------------------------------------------------
 
-        # Remove NaN and infinity.
+        neighbor_metrics = (
+            output.loc[
+                neighbor_indices,
+                metric,
+            ]
+            .astype(float)
+        )
+
+        # Remove NaN and +/- infinity.
         valid_mask = np.isfinite(
             neighbor_metrics.to_numpy()
         )
 
         valid_neighbor_metrics = (
             neighbor_metrics.iloc[
-                np.flatnonzero(valid_mask)
+                np.flatnonzero(
+                    valid_mask
+                )
             ]
         )
 
-        if config.require_positive_neighbor_metric:
+        if (
+            config
+            .require_positive_neighbor_metric
+        ):
             valid_neighbor_metrics = (
                 valid_neighbor_metrics[
-                    valid_neighbor_metrics > 0
+                    valid_neighbor_metrics
+                    > 0
                 ]
             )
 
@@ -426,24 +656,47 @@ def add_neighborhood_robustness(
         if (
             valid_neighbor_count
             < config.min_neighbors
-            or not np.isfinite(center_metric)
+            or not np.isfinite(
+                center_metric
+            )
             or center_metric <= 0
         ):
-            neighbor_means.append(np.nan)
-            neighbor_medians.append(np.nan)
-            neighbor_minimums.append(np.nan)
-            neighbor_stds.append(np.nan)
+            neighbor_means.append(
+                np.nan
+            )
 
-            healthy_counts.append(0)
-            healthy_fractions.append(np.nan)
+            neighbor_medians.append(
+                np.nan
+            )
 
-            neighborhood_ratios.append(np.nan)
-            robustness_scores.append(np.nan)
+            neighbor_minimums.append(
+                np.nan
+            )
+
+            neighbor_stds.append(
+                np.nan
+            )
+
+            healthy_counts.append(
+                0
+            )
+
+            healthy_fractions.append(
+                np.nan
+            )
+
+            neighborhood_ratios.append(
+                np.nan
+            )
+
+            robustness_scores.append(
+                np.nan
+            )
 
             continue
 
         # -----------------------------------------------------
-        # Neighborhood descriptive statistics
+        # Descriptive neighborhood statistics
         # -----------------------------------------------------
 
         neighbor_mean = float(
@@ -481,7 +734,7 @@ def add_neighborhood_robustness(
         )
 
         # -----------------------------------------------------
-        # Healthy-neighbor calculation
+        # Healthy-neighbor fraction
         # -----------------------------------------------------
 
         healthy_threshold = (
@@ -510,16 +763,7 @@ def add_neighborhood_robustness(
         )
 
         # -----------------------------------------------------
-        # Neighborhood ratio
-        # -----------------------------------------------------
-        #
-        # center = 1.50
-        # median neighbor = 1.35
-        #
-        # ratio = 0.90
-        #
-        # A ratio near 1 means the selected configuration is not
-        # dramatically better than its immediate surroundings.
+        # Neighborhood performance ratio
         # -----------------------------------------------------
 
         neighborhood_ratio = (
@@ -534,16 +778,12 @@ def add_neighborhood_robustness(
         # -----------------------------------------------------
         # Combined robustness
         # -----------------------------------------------------
-        #
-        # Cap neighborhood ratio at 1.
-        #
-        # If neighboring configurations happen to outperform
-        # the center candidate, that should not create a
-        # robustness score greater than 1.
-        # -----------------------------------------------------
 
         clipped_ratio = min(
-            max(neighborhood_ratio, 0.0),
+            max(
+                neighborhood_ratio,
+                0.0,
+            ),
             1.0,
         )
 
@@ -555,6 +795,10 @@ def add_neighborhood_robustness(
         robustness_scores.append(
             robustness
         )
+
+    # ---------------------------------------------------------
+    # Attach robustness results
+    # ---------------------------------------------------------
 
     output[
         "neighbor_count"
