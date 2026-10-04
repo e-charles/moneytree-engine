@@ -195,13 +195,306 @@ def test_highest_eligible_sharpe_is_ranked_first() -> None:
     assert ranked.iloc[0]["sharpe"] == pytest.approx(
         1.60
     )
+    
+
+def test_more_trades_break_exact_metric_tie() -> None:
+    results = pd.DataFrame(
+        {
+            "rsi_length": [10, 14],
+            "oversold": [30.0, 30.0],
+            "overbought": [70.0, 70.0],
+            "max_bars_between_dips": [5, 5],
+
+            "closed_trades": [15, 25],
+
+            "total_return": [0.20, 0.20],
+            "annualized_return": [0.10, 0.10],
+
+            "max_drawdown": [-0.10, -0.10],
+
+            "sharpe": [1.50, 1.50],
+
+            "profit_factor": [2.0, 2.0],
+        }
+    )
+
+    config = SelectionConfig(
+        min_closed_trades=1,
+        ranking_metric="sharpe",
+    )
+
+    ranked = rank_candidates(
+        results,
+        config,
+    )
+
+    # Same Sharpe.
+    # RSI 14 wins because it has 25 trades rather than 15.
+    assert ranked.iloc[0]["rsi_length"] == 14
 
 
-# def test_more_trades_break_exact_metric_tie() -> None:
-#     results = pd.DataFrame(
+def test_higher_return_breaks_trade_count_tie() -> None:
+    results = pd.DataFrame(
+        {
+            "rsi_length": [10, 14],
+            "oversold": [30.0, 30.0],
+            "overbought": [70.0, 70.0],
+            "max_bars_between_dips": [5, 5],
+
+            "closed_trades": [20, 20],
+
+            "total_return": [0.20, 0.30],
+            "annualized_return": [0.10, 0.15],
+
+            "max_drawdown": [-0.10, -0.10],
+
+            "sharpe": [1.50, 1.50],
+
+            "profit_factor": [2.0, 2.0],
+        }
+    )
+
+    config = SelectionConfig(
+        min_closed_trades=1,
+        ranking_metric="sharpe",
+    )
+
+    ranked = rank_candidates(
+        results,
+        config,
+    )
+
+    assert ranked.iloc[0]["rsi_length"] == 14
 
 
+def test_better_drawdown_breaks_remaining_tie() -> None:
+    results = pd.DataFrame(
+        {
+            "rsi_length": [10, 14],
+            "oversold": [30.0, 30.0],
+            "overbought": [70.0, 70.0],
+            "max_bars_between_dips": [5, 5],
 
+            "closed_trades": [20, 20],
+
+            "total_return": [0.25, 0.25],
+            "annualized_return": [0.15, 0.15],
+
+            # RSI 14 has the smaller drawdown.
+            "max_drawdown": [-0.20, -0.10],
+
+            "sharpe": [1.50, 1.50],
+
+            "profit_factor": [2.0, 2.0],
+        }
+    )
+
+    config = SelectionConfig(
+        min_closed_trades=1,
+        ranking_metric="sharpe",
+    )
+
+    ranked = rank_candidates(
+        results,
+        config,
+    )
+
+    assert ranked.iloc[0]["rsi_length"] == 14
+
+
+# ============================================================
+# SELECTION
+# ============================================================
+
+
+def test_selection_returns_correct_parameters() -> None:
+    results = make_results()
+
+    config = SelectionConfig(
+        min_closed_trades=10,
+        ranking_metric="sharpe",
+    )
+
+    selected = select_double_dip_candidate(
+        results,
+        config,
+    )
+
+    expected_parameters = DoubleDipParameters(
+        rsi_length=12,
+        oversold=30.0,
+        overbought=70.0,
+        max_bars_between_dips=7,
+    )
+
+    assert selected.parameters == expected_parameters
+
+    assert selected.ranking_metric == "sharpe"
+
+    assert selected.ranking_value == pytest.approx(
+        1.60
+    )
+
+    assert selected.closed_trades == 22
+
+    assert selected.total_return == pytest.approx(
+        0.35
+    )
+
+
+def test_no_eligible_candidate_raises() -> None:
+    results = make_results()
+
+    config = SelectionConfig(
+        # No candidate has 1000 trades.
+        min_closed_trades=1000,
+        ranking_metric="sharpe",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="No eligible optimization candidates",
+    ):
+        select_double_dip_candidate(
+            results,
+            config,
+        )
+
+
+# ============================================================
+# IMMUTABILITY
+# ============================================================
+
+
+def test_filter_does_not_modify_original_results() -> None:
+    results = make_results()
+
+    original = results.copy(
+        deep=True
+    )
+
+    config = SelectionConfig(
+        min_closed_trades=10,
+        ranking_metric="sharpe",
+    )
+
+    filter_eligible_candidates(
+        results,
+        config,
+    )
+
+    pd.testing.assert_frame_equal(
+        results,
+        original,
+    )
+
+
+def test_ranking_does_not_modify_original_results() -> None:
+    results = make_results()
+
+    original = results.copy(
+        deep=True
+    )
+
+    config = SelectionConfig(
+        min_closed_trades=10,
+        ranking_metric="sharpe",
+    )
+
+    rank_candidates(
+        results,
+        config,
+    )
+
+    pd.testing.assert_frame_equal(
+        results,
+        original,
+    )
+
+
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
+
+def test_invalid_minimum_trades_rejected() -> None:
+    with pytest.raises(
+        ValueError,
+        match="min_closed_trades must be at least 1",
+    ):
+        SelectionConfig(
+            min_closed_trades=0,
+        )
+
+
+def test_unsupported_ranking_metric_rejected() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Unsupported ranking_metric",
+    ):
+        SelectionConfig(
+            ranking_metric="magic_metric",
+        )
+
+
+def test_zero_drawdown_limit_rejected() -> None:
+    with pytest.raises(
+        ValueError,
+        match="max_allowed_drawdown",
+    ):
+        SelectionConfig(
+            max_allowed_drawdown=0.0,
+        )
+
+
+def test_drawdown_limit_above_one_rejected() -> None:
+    with pytest.raises(
+        ValueError,
+        match="max_allowed_drawdown",
+    ):
+        SelectionConfig(
+            max_allowed_drawdown=1.10,
+        )
+
+
+# ============================================================
+# RESULT VALIDATION
+# ============================================================
+
+
+def test_empty_results_rejected() -> None:
+    results = pd.DataFrame()
+
+    config = SelectionConfig()
+
+    with pytest.raises(
+        ValueError,
+        match="optimization results cannot be empty",
+    ):
+        filter_eligible_candidates(
+            results,
+            config,
+        )
+
+
+def test_missing_required_columns_rejected() -> None:
+    results = pd.DataFrame(
+        {
+            "rsi_length": [14],
+            "sharpe": [1.5],
+        }
+    )
+
+    config = SelectionConfig()
+
+    with pytest.raises(
+        ValueError,
+        match="Missing required optimization columns",
+    ):
+        filter_eligible_candidates(
+            results,
+            config,
+        )
 
 
 def test_infinite_profit_factor_can_be_ranked() -> None:

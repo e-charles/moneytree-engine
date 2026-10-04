@@ -43,6 +43,9 @@ class SelectionConfig:
 
     require_positive_return:
         If True, candidates with total_return <= 0 are rejected.
+    
+    min_neighborhood_robustness: 
+        Minimum number of robustness required to be considered eligible
     """
 
     min_closed_trades: int = 10
@@ -52,6 +55,8 @@ class SelectionConfig:
     max_allowed_drawdown: float | None = None
 
     require_positive_return: bool = True
+
+    min_neighborhood_robustness: float | None = None
 
     def __post_init__(self) -> None:
 
@@ -71,6 +76,13 @@ class SelectionConfig:
                 raise ValueError(
                     "max_allowed_drawdown must be "
                     "greater than 0 and less than or equal to 1"
+                )
+            
+        if self.min_neighborhood_robustness is not None:
+            if not 0 <= self.min_neighborhood_robustness <= 1:
+                raise ValueError(
+                    "min_neighborhood_robustness must be "
+                    "between 0 and 1"
                 )
 
 
@@ -211,6 +223,31 @@ def filter_eligible_candidates(
         eligible[metric].notna()
     ]
 
+    
+    # ---------------------------------------------------------
+    # 5. Robustness must be met
+    # ---------------------------------------------------------
+
+    if config.min_neighborhood_robustness is not None:
+
+        if "neighborhood_robustness" not in eligible.columns:
+            raise ValueError(
+                "neighborhood_robustness column is required "
+                "when min_neighborhood_robustness is configured"
+            )
+
+        eligible = eligible[
+            eligible[
+                "neighborhood_robustness"
+            ].notna()
+        ]
+
+        eligible = eligible[
+            eligible[
+                "neighborhood_robustness"
+            ]
+            >= config.min_neighborhood_robustness
+        ]
     return eligible.copy()
 
 
