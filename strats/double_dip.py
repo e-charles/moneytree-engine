@@ -2,131 +2,306 @@
 
 from __future__ import annotations
 
-import pandas as pd
+import numpy as np
+from numpy.typing import NDArray
 
 
 def rsi_double_dip_targets(
-    rsi: pd.Series,
+    rsi: NDArray[np.float64],
     oversold: float = 30.0,
     overbought: float = 70.0,
-    max_bars_between_dips: int = 10
-) -> pd.Series:
+    max_bars_between_dips: int = 10,
+) -> NDArray[np.int8]:
     """
-    Long-only RSI double-dip strategy.
+    Generate long-only RSI Double Dip target positions.
 
-    Entry:
-      1. RSI reaches or falls below `oversold` (first dip).
-      2. RSI later recovers above `oversold`.
-      3. RSI reaches or falls below `oversold` again within
-         `max_bars_between_dips` bars of the first dip.
-      4. RSI recovers above `oversold` a second time.
-      5. Target becomes LONG on that completed bar.
+    Parameters
+    ----------
+    rsi:
+        One-dimensional NumPy array containing RSI values.
 
-    Exit:
-      1. RSI reaches or rises above `overbought` (first peak).
-      2. RSI later falls below `overbought`.
-      3. RSI reaches or rises above `overbought` again.
-      4. RSI falls below `overbought` a second time.
-      5. Target becomes FLAT on that completed bar.
+        NaN values are allowed, primarily for the RSI warm-up
+        period.
 
-    The returned series is a target position decided at each bar's close.
-    Shift it by one bar before backtesting if fills occur at the next open.
+    oversold:
+        RSI level at or below which an oversold episode occurs.
 
-    Returns:
-        A Series of 0 (flat) and 1 (long).
+    overbought:
+        RSI level at or above which an overbought episode occurs.
+
+    max_bars_between_dips:
+        Maximum number of bars allowed between the first
+        oversold observation and the second oversold episode.
+
+    Returns
+    -------
+    NDArray[np.int8]
+        Target position decided at each bar's close.
+
+        0 = flat
+        1 = long
+
+    Notes
+    -----
+    These are close-based target positions.
+
+    The backtesting engine is responsible for converting:
+
+        target[t]
+
+    into execution at:
+
+        Open[t + 1]
     """
-    if rsi.empty:
-        raise ValueError("rsi cannot be empty")
 
-    if not 0 < oversold < overbought < 100:
-        raise ValueError(
-            "Thresholds must satisfy 0 < oversold < overbought < 100."
-        )
+    # =========================================================
+    # VALIDATION
+    # =========================================================
 
-    if max_bars_between_dips < 1:
-        raise ValueError("max_bars_between_dips must be at least 1.")
+    # if not isinstance(rsi, np.ndarray):
+    #     raise TypeError(
+    #         "rsi must be a NumPy ndarray"
+    #     )
+
+    # if rsi.ndim != 1:
+    #     raise ValueError(
+    #         "rsi must be one-dimensional"
+    #     )
+
+    # if rsi.size == 0:
+    #     raise ValueError(
+    #         "rsi cannot be empty"
+    #     )
+
+    # if not (
+    #     0
+    #     < oversold
+    #     < overbought
+    #     < 100
+    # ):
+    #     raise ValueError(
+    #         "Thresholds must satisfy "
+    #         "0 < oversold < overbought < 100."
+    #     )
+
+    # if max_bars_between_dips < 1:
+    #     raise ValueError(
+    #         "max_bars_between_dips must be at least 1."
+    #     )
+
+    # =========================================================
+    # OUTPUT
+    # =========================================================
+    #
+    # We know the exact number of output observations ahead of
+    # time, so allocate the result array once rather than
+    # repeatedly growing a Python list.
+    # =========================================================
+
+    bar_count = rsi.size
+
+    targets = np.empty(
+        bar_count,
+        dtype=np.int8,
+    )
+
+    # =========================================================
+    # POSITION STATE
+    # =========================================================
 
     position = 0
-    targets: list[int] = []
 
-    # Entry-side state.
-    first_oversold_bar: int | None = None
+    # =========================================================
+    # ENTRY STATE
+    # =========================================================
+    #
+    # -1 means there is currently no first oversold bar.
+    #
+    # This avoids Optional[int] / None checks inside the hot
+    # state-machine loop.
+    # =========================================================
+
+    first_oversold_bar = -1
+
     first_oversold_recovered = False
     second_oversold_seen = False
 
-    # Exit-side state.
+    # =========================================================
+    # EXIT STATE
+    # =========================================================
+
     first_overbought_seen = False
     first_overbought_recovered = False
     second_overbought_seen = False
 
-    previous_rsi: float | None = None
+    # =========================================================
+    # PREVIOUS RSI
+    # =========================================================
+    #
+    # NaN represents:
+    #
+    #     no usable previous RSI observation
+    #
+    # This naturally handles the RSI warm-up period.
+    # =========================================================
 
-    for bar_number, value in enumerate(rsi):
-        if pd.isna(value):
-            targets.append(position)
-            previous_rsi = None
+    previous_rsi = np.nan
+
+    # =========================================================
+    # STRATEGY STATE MACHINE
+    # =========================================================
+
+    for bar_number in range(bar_count):
+
+        value = rsi[bar_number]
+
+        # -----------------------------------------------------
+        # Missing RSI
+        # -----------------------------------------------------
+        #
+        # Primarily occurs during indicator warm-up.
+        #
+        # Preserve the current target and break continuity with
+        # the previous RSI observation.
+        # -----------------------------------------------------
+
+        if np.isnan(value):
+
+            targets[
+                bar_number
+            ] = position
+
+            previous_rsi = np.nan
+
             continue
 
-        is_oversold = value <= oversold
-        is_overbought = value >= overbought
+        # -----------------------------------------------------
+        # Current RSI state
+        # -----------------------------------------------------
+
+        is_oversold = (
+            value <= oversold
+        )
+
+        is_overbought = (
+            value >= overbought
+        )
+
+        has_previous_rsi = (
+            not np.isnan(
+                previous_rsi
+            )
+        )
+
+        # -----------------------------------------------------
+        # Threshold crossings
+        # -----------------------------------------------------
 
         crossed_above_oversold = (
-            previous_rsi is not None
+            has_previous_rsi
             and previous_rsi <= oversold
             and value > oversold
         )
 
         crossed_below_overbought = (
-            previous_rsi is not None
+            has_previous_rsi
             and previous_rsi >= overbought
             and value < overbought
         )
 
+        # =====================================================
+        # FLAT
+        # =====================================================
+
         if position == 0:
-            # Expire an old first-dip setup.
+
+            # -------------------------------------------------
+            # Expire an old first-dip setup
+            # -------------------------------------------------
+
             if (
-                first_oversold_bar is not None
-                and bar_number - first_oversold_bar > max_bars_between_dips
+                first_oversold_bar >= 0
+                and (
+                    bar_number
+                    - first_oversold_bar
+                    > max_bars_between_dips
+                )
             ):
-                first_oversold_bar = None
+                first_oversold_bar = -1
                 first_oversold_recovered = False
                 second_oversold_seen = False
 
-            # First oversold episode arms the setup.
-            if first_oversold_bar is None and is_oversold:
-                first_oversold_bar = bar_number
+            # -------------------------------------------------
+            # First oversold episode
+            # -------------------------------------------------
 
-            # RSI must leave oversold after first dip before a second dip counts.
+            if (
+                first_oversold_bar < 0
+                and is_oversold
+            ):
+                first_oversold_bar = (
+                    bar_number
+                )
+
+            # -------------------------------------------------
+            # Recovery after first oversold episode
+            # -------------------------------------------------
+
             elif (
-                first_oversold_bar is not None
+                first_oversold_bar >= 0
                 and not first_oversold_recovered
                 and crossed_above_oversold
             ):
                 first_oversold_recovered = True
 
-            # Second oversold episode occurs after first recovery.
+            # -------------------------------------------------
+            # Second oversold episode
+            # -------------------------------------------------
+
             elif (
-                first_oversold_bar is not None
+                first_oversold_bar >= 0
                 and first_oversold_recovered
                 and is_oversold
             ):
                 second_oversold_seen = True
 
-            # Enter upon recovery from the second oversold episode.
-            elif second_oversold_seen and crossed_above_oversold:
+            # -------------------------------------------------
+            # Recovery after second oversold episode
+            #
+            # ENTRY SIGNAL
+            # -------------------------------------------------
+
+            elif (
+                second_oversold_seen
+                and crossed_above_oversold
+            ):
                 position = 1
 
-                # Reset entry state after entering.
-                first_oversold_bar = None
+                # Reset entry state.
+                first_oversold_bar = -1
                 first_oversold_recovered = False
                 second_oversold_seen = False
 
+        # =====================================================
+        # LONG
+        # =====================================================
+
         else:
-            # First overbought episode arms the exit setup.
-            if not first_overbought_seen and is_overbought:
+
+            # -------------------------------------------------
+            # First overbought episode
+            # -------------------------------------------------
+
+            if (
+                not first_overbought_seen
+                and is_overbought
+            ):
                 first_overbought_seen = True
 
-            # RSI must leave overbought before a second peak counts.
+            # -------------------------------------------------
+            # First drop below overbought
+            # -------------------------------------------------
+
             elif (
                 first_overbought_seen
                 and not first_overbought_recovered
@@ -134,7 +309,10 @@ def rsi_double_dip_targets(
             ):
                 first_overbought_recovered = True
 
-            # Second overbought episode.
+            # -------------------------------------------------
+            # Second overbought episode
+            # -------------------------------------------------
+
             elif (
                 first_overbought_seen
                 and first_overbought_recovered
@@ -142,16 +320,31 @@ def rsi_double_dip_targets(
             ):
                 second_overbought_seen = True
 
-            # Exit after second fall below overbought.
-            elif second_overbought_seen and crossed_below_overbought:
+            # -------------------------------------------------
+            # Second drop below overbought
+            #
+            # EXIT SIGNAL
+            # -------------------------------------------------
+
+            elif (
+                second_overbought_seen
+                and crossed_below_overbought
+            ):
                 position = 0
 
-                # Reset exit state after closing.
+                # Reset exit state.
                 first_overbought_seen = False
                 first_overbought_recovered = False
                 second_overbought_seen = False
 
-        targets.append(position)
-        previous_rsi = float(value)
+        # =====================================================
+        # RECORD CLOSE-BASED TARGET
+        # =====================================================
 
-    return pd.Series(targets, index=rsi.index, dtype="int8")
+        targets[
+            bar_number
+        ] = position
+
+        previous_rsi = value
+
+    return targets

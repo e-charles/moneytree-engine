@@ -1,35 +1,46 @@
-# optimization/walk_forward
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
+
 from ta.momentum import RSIIndicator
 
 from backtesting.engine import (
     BacktestConfig,
     BacktestResult,
     run_backtest,
+    validate_backtest_config,
 )
-from backtesting.metrics import calculate_metrics
+
+from backtesting.metrics import (
+    calculate_metrics,
+)
 
 from optimization.robustness import (
     NeighborhoodConfig,
     add_neighborhood_robustness,
 )
+
 from optimization.search_space import (
     DoubleDipParameters,
     DoubleDipSearchSpace,
 )
+
 from optimization.selection import (
     SelectedDoubleDipCandidate,
     SelectionConfig,
     select_double_dip_candidate,
 )
-from optimization.static import optimize_double_dip
 
-from strats.double_dip import rsi_double_dip_targets
+from optimization.static import (
+    optimize_double_dip,
+)
+
+from strats.double_dip import (
+    rsi_double_dip_targets,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +66,7 @@ class WalkForwardConfig:
         If False, use a rolling training window.
 
         Example:
+
             Fold 1 train: 0:500
             Fold 2 train: 100:600
 
@@ -62,6 +74,7 @@ class WalkForwardConfig:
         and expand the training history.
 
         Example:
+
             Fold 1 train: 0:500
             Fold 2 train: 0:600
 
@@ -99,9 +112,6 @@ class WalkForwardConfig:
                 "step_bars must be at least 1"
             )
 
-        # Overlapping test folds make aggregate out-of-sample
-        # performance difficult to interpret because the same
-        # market bars would be evaluated more than once.
         if (
             self.step_bars is not None
             and self.step_bars < self.test_bars
@@ -155,6 +165,9 @@ def _validate_market_data(
 ) -> None:
     """
     Validate market data required by walk-forward optimization.
+
+    This validation occurs once before any walk-forward folds
+    are evaluated.
     """
 
     if data.empty:
@@ -173,7 +186,8 @@ def _validate_market_data(
 
     if missing:
         raise ValueError(
-            f"Missing required columns: {sorted(missing)}"
+            "Missing required columns: "
+            f"{sorted(missing)}"
         )
 
     if data.index.has_duplicates:
@@ -186,17 +200,17 @@ def _validate_market_data(
             "data index must be sorted in ascending order"
         )
 
-    if data[
+    prices = data[
         ["Open", "Close"]
-    ].isna().any().any():
+    ]
+
+    if prices.isna().any().any():
         raise ValueError(
             "Open and Close cannot contain NaN values"
         )
 
     if (
-        data[
-            ["Open", "Close"]
-        ] <= 0
+        prices <= 0
     ).any().any():
         raise ValueError(
             "Open and Close prices must be greater than zero"
@@ -217,12 +231,14 @@ def _evaluate_test_window(
     """
     Evaluate frozen parameters on one unseen test window.
 
-    Historical Close data before the test window is included
-    when calculating RSI and rebuilding strategy state.
+    Historical Close data through the test window is used to
+    calculate RSI and rebuild strategy state.
 
-    No future data beyond the end of the test window is used.
+    No data after test_end_position is used.
 
-    The returned backtest itself contains only test-window bars.
+    Once RSI has been calculated, strategy generation,
+    backtesting, and metric calculation operate entirely on
+    NumPy arrays.
     """
 
     if test_start_position < 0:
@@ -236,85 +252,128 @@ def _evaluate_test_window(
             "test_start_position"
         )
 
-    # ---------------------------------------------------------
-    # 1. Build historical context
-    # ---------------------------------------------------------
-    #
-    # Everything through the end of the test window is legal:
-    #
-    #     history ... train | test
-    #
-    # No observation after test_end_position is included.
-    # ---------------------------------------------------------
+    if test_end_position > len(data):
+        raise ValueError(
+            "test_end_position cannot exceed data length"
+        )
 
-    history_through_test = data.iloc[
+    # =========================================================
+    # 1. BUILD HISTORICAL CONTEXT
+    # =========================================================
+    #
+    # We allow information through:
+    #
+    #     test_end_position - 1
+    #
+    # because each RSI observation is calculated only from
+    # current and past Close prices.
+    #
+    # No future observations after the test window are included.
+    # =========================================================
+
+    history_close = data[
+        "Close"
+    ].iloc[
         :test_end_position
     ]
 
+    # =========================================================
+    # 2. CALCULATE RSI
+    # =========================================================
+    #
+    # RSIIndicator currently uses pandas, so this is the one
+    # remaining pandas calculation in the test numerical path.
+    #
+    # Immediately convert the result to NumPy.
+    # =========================================================
+
     rsi = RSIIndicator(
-        close=history_through_test["Close"],
+        close=history_close,
         window=parameters.rsi_length,
-    ).rsi()
-
-    # ---------------------------------------------------------
-    # 2. Reconstruct strategy state
-    # ---------------------------------------------------------
-    #
-    # Running the strategy over historical RSI allows state such
-    # as the first oversold dip to exist immediately before the
-    # test window.
-    #
-    # Parameters are already frozen at this point.
-    # ---------------------------------------------------------
-
-    target_with_history = rsi_double_dip_targets(
-        rsi=rsi,
-        oversold=parameters.oversold,
-        overbought=parameters.overbought,
-        max_bars_between_dips=(
-            parameters.max_bars_between_dips
-        ),
+    ).rsi().to_numpy(
+        dtype=np.float64,
+        copy=False,
     )
 
-    # ---------------------------------------------------------
-    # 3. Extract ONLY the unseen test period
-    # ---------------------------------------------------------
+    # =========================================================
+    # 3. REBUILD STRATEGY STATE WITH NUMPY
+    # =========================================================
+    #
+    # The strategy runs over the historical RSI context so state
+    # immediately before the test window is reconstructed.
+    # =========================================================
 
-    test_data = data.iloc[
+    target_with_history = (
+        rsi_double_dip_targets(
+            rsi=rsi,
+            oversold=parameters.oversold,
+            overbought=parameters.overbought,
+            max_bars_between_dips=(
+                parameters.max_bars_between_dips
+            ),
+        )
+    )
+
+    # =========================================================
+    # 4. EXTRACT TEST-WINDOW NUMPY ARRAYS
+    # =========================================================
+
+    open_prices = data[
+        "Open"
+    ].iloc[
+        test_start_position:test_end_position
+    ].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
+    close_prices = data[
+        "Close"
+    ].iloc[
+        test_start_position:test_end_position
+    ].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
+    test_target = target_with_history[
         test_start_position:test_end_position
     ]
 
-    test_target = target_with_history.reindex(
-        test_data.index
-    )
-
-    # ---------------------------------------------------------
-    # 4. Run isolated out-of-sample backtest
-    # ---------------------------------------------------------
+    # =========================================================
+    # 5. RUN OUT-OF-SAMPLE BACKTEST
+    # =========================================================
     #
-    # Every fold starts with backtest_config.initial_cash.
+    # The full walk-forward market dataset and configuration
+    # were validated before entering the fold loop.
     #
-    # Therefore each fold measures the frozen parameter
-    # configuration independently.
-    # ---------------------------------------------------------
+    # rsi_double_dip_targets() is responsible for producing
+    # binary target arrays.
+    # =========================================================
 
     result = run_backtest(
-        data=test_data,
+        open_prices=open_prices,
+        close_prices=close_prices,
         target_at_close=test_target,
         config=backtest_config,
+        inputs_prevalidated=True,
     )
 
-    # ---------------------------------------------------------
-    # 5. Calculate out-of-sample metrics
-    # ---------------------------------------------------------
+    # =========================================================
+    # 6. CALCULATE OUT-OF-SAMPLE METRICS
+    # =========================================================
 
     metrics = calculate_metrics(
         equity=result.equity,
         trades=result.trades,
         periods_per_year=periods_per_year,
+        inputs_prevalidated=True,
     )
 
-    return metrics, result
+    return (
+        metrics,
+        result,
+    )
 
 
 def _build_summary_row(
@@ -325,26 +384,56 @@ def _build_summary_row(
     test_metrics: dict[str, float | int],
 ) -> dict[str, object]:
     """
-    Construct one flat walk-forward summary row.
+    Construct one flat human-readable walk-forward summary row.
+
+    This function belongs to the orchestration/reporting side of
+    walk-forward processing, so use of pandas indexes here is
+    intentional.
     """
 
-    parameters = selected.parameters
+    parameters = (
+        selected.parameters
+    )
 
     return {
         "fold": fold_number,
 
-        "train_start": train_data.index[0],
-        "train_end": train_data.index[-1],
+        "train_start": (
+            train_data.index[0]
+        ),
 
-        "test_start": test_data.index[0],
-        "test_end": test_data.index[-1],
+        "train_end": (
+            train_data.index[-1]
+        ),
 
-        "train_bars": len(train_data),
-        "test_bars": len(test_data),
+        "test_start": (
+            test_data.index[0]
+        ),
 
-        "rsi_length": parameters.rsi_length,
-        "oversold": parameters.oversold,
-        "overbought": parameters.overbought,
+        "test_end": (
+            test_data.index[-1]
+        ),
+
+        "train_bars": len(
+            train_data
+        ),
+
+        "test_bars": len(
+            test_data
+        ),
+
+        "rsi_length": (
+            parameters.rsi_length
+        ),
+
+        "oversold": (
+            parameters.oversold
+        ),
+
+        "overbought": (
+            parameters.overbought
+        ),
+
         "max_bars_between_dips": (
             parameters.max_bars_between_dips
         ),
@@ -382,31 +471,45 @@ def _build_summary_row(
         ),
 
         "test_closed_trades": int(
-            test_metrics["closed_trades"]
+            test_metrics[
+                "closed_trades"
+            ]
         ),
 
         "test_total_return": float(
-            test_metrics["total_return"]
+            test_metrics[
+                "total_return"
+            ]
         ),
 
         "test_annualized_return": float(
-            test_metrics["annualized_return"]
+            test_metrics[
+                "annualized_return"
+            ]
         ),
 
         "test_annualized_volatility": float(
-            test_metrics["annualized_volatility"]
+            test_metrics[
+                "annualized_volatility"
+            ]
         ),
 
         "test_max_drawdown": float(
-            test_metrics["max_drawdown"]
+            test_metrics[
+                "max_drawdown"
+            ]
         ),
 
         "test_sharpe": float(
-            test_metrics["sharpe"]
+            test_metrics[
+                "sharpe"
+            ]
         ),
 
         "test_profit_factor": float(
-            test_metrics["profit_factor"]
+            test_metrics[
+                "profit_factor"
+            ]
         ),
     }
 
@@ -427,18 +530,25 @@ def walk_forward_optimize_double_dip(
     For each fold:
 
         1. Construct the in-sample training window.
-        2. Optimize every candidate using ONLY training data.
-        3. Measure parameter-neighborhood robustness using ONLY
-           training results.
+        2. Optimize candidates using only training data.
+        3. Calculate neighborhood robustness using only
+           training-period results.
         4. Apply eligibility rules and select the winner.
         5. Freeze the selected parameters.
-        6. Evaluate those parameters on the following unseen
-           test window.
+        6. Evaluate those frozen parameters on the following
+           unseen test window.
 
-    Test-window results never participate in parameter selection.
+    Test-window results never participate in candidate
+    selection.
     """
 
-    _validate_market_data(data)
+    # =========================================================
+    # 1. VALIDATE GLOBAL INPUTS ONCE
+    # =========================================================
+
+    _validate_market_data(
+        data
+    )
 
     if periods_per_year <= 0:
         raise ValueError(
@@ -446,37 +556,66 @@ def walk_forward_optimize_double_dip(
         )
 
     if selection_config is None:
-        selection_config = SelectionConfig()
+        selection_config = (
+            SelectionConfig()
+        )
 
     if neighborhood_config is None:
-        neighborhood_config = NeighborhoodConfig()
+        neighborhood_config = (
+            NeighborhoodConfig()
+        )
 
     if backtest_config is None:
-        backtest_config = BacktestConfig()
+        backtest_config = (
+            BacktestConfig()
+        )
 
-    if len(data) <= walk_forward_config.train_bars:
+    validate_backtest_config(
+        backtest_config
+    )
+
+    if (
+        len(data)
+        <= walk_forward_config.train_bars
+    ):
         raise ValueError(
             "data must contain more bars than train_bars"
         )
 
+    # =========================================================
+    # 2. DETERMINE FOLD STEP
+    # =========================================================
+
     step_bars = (
         walk_forward_config.step_bars
-        if walk_forward_config.step_bars is not None
+        if walk_forward_config.step_bars
+        is not None
         else walk_forward_config.test_bars
     )
 
-    folds: list[WalkForwardFold] = []
-    summary_rows: list[dict[str, object]] = []
+    folds: list[
+        WalkForwardFold
+    ] = []
 
-    # First unseen bar immediately follows the initial
-    # training window.
+    summary_rows: list[
+        dict[str, object]
+    ] = []
+
+    # The first unseen bar follows the initial training window.
     test_start_position = (
         walk_forward_config.train_bars
     )
 
     fold_number = 0
 
-    while test_start_position < len(data):
+    # =========================================================
+    # 3. WALK FORWARD THROUGH TIME
+    # =========================================================
+
+    while (
+        test_start_position
+        < len(data)
+    ):
 
         test_end_position = (
             test_start_position
@@ -484,10 +623,13 @@ def walk_forward_optimize_double_dip(
         )
 
         # -----------------------------------------------------
-        # Handle final incomplete test window
+        # Final partial test window
         # -----------------------------------------------------
 
-        if test_end_position > len(data):
+        if (
+            test_end_position
+            > len(data)
+        ):
 
             if (
                 not walk_forward_config
@@ -495,15 +637,22 @@ def walk_forward_optimize_double_dip(
             ):
                 break
 
-            test_end_position = len(data)
+            test_end_position = (
+                len(data)
+            )
 
         # -----------------------------------------------------
-        # Construct training boundaries
+        # Training boundaries
         # -----------------------------------------------------
 
-        if walk_forward_config.expanding:
+        if (
+            walk_forward_config.expanding
+        ):
+
             train_start_position = 0
+
         else:
+
             train_start_position = (
                 test_start_position
                 - walk_forward_config.train_bars
@@ -513,83 +662,125 @@ def walk_forward_optimize_double_dip(
             test_start_position
         )
 
+        # -----------------------------------------------------
+        # Build train/test views
+        # -----------------------------------------------------
+        #
+        # pandas remains useful here because fold construction
+        # is orchestration, not the numerical candidate hot
+        # path.
+        # -----------------------------------------------------
+
         train_data = data.iloc[
-            train_start_position:train_end_position
+            train_start_position:
+            train_end_position
         ]
 
         test_data = data.iloc[
-            test_start_position:test_end_position
+            test_start_position:
+            test_end_position
         ]
 
         # =====================================================
-        # 1. STATIC OPTIMIZATION
+        # 4. STATIC TRAINING OPTIMIZATION
         # =====================================================
 
-        optimization_results = optimize_double_dip(
-            data=train_data,
-            search_space=search_space,
-            backtest_config=backtest_config,
-            periods_per_year=periods_per_year,
-        )
-
-        # =====================================================
-        # 2. NEIGHBORHOOD ROBUSTNESS
-        # =====================================================
-
-        robust_results = add_neighborhood_robustness(
-            results=optimization_results,
-            config=neighborhood_config,
-        )
-
-        # =====================================================
-        # 3. SELECTION
-        # =====================================================
-
-        selected = select_double_dip_candidate(
-            results=robust_results,
-            config=selection_config,
-        )
-
-        # =====================================================
-        # 4. FREEZE PARAMETERS AND TEST OUT OF SAMPLE
-        # =====================================================
-
-        test_metrics, test_backtest = (
-            _evaluate_test_window(
-                data=data,
-                test_start_position=(
-                    test_start_position
-                ),
-                test_end_position=(
-                    test_end_position
-                ),
-                parameters=selected.parameters,
+        optimization_results = (
+            optimize_double_dip(
+                data=train_data,
+                search_space=search_space,
                 backtest_config=backtest_config,
                 periods_per_year=periods_per_year,
             )
         )
 
         # =====================================================
-        # 5. RECORD FOLD
+        # 5. NEIGHBORHOOD ROBUSTNESS
+        # =====================================================
+
+        robust_results = (
+            add_neighborhood_robustness(
+                results=optimization_results,
+                config=neighborhood_config,
+            )
+        )
+
+        # =====================================================
+        # 6. SELECT TRAINING-PERIOD WINNER
+        # =====================================================
+
+        selected = (
+            select_double_dip_candidate(
+                results=robust_results,
+                config=selection_config,
+            )
+        )
+
+        # =====================================================
+        # 7. FREEZE PARAMETERS AND TEST OUT OF SAMPLE
+        # =====================================================
+
+        (
+            test_metrics,
+            test_backtest,
+        ) = _evaluate_test_window(
+            data=data,
+            test_start_position=(
+                test_start_position
+            ),
+            test_end_position=(
+                test_end_position
+            ),
+            parameters=(
+                selected.parameters
+            ),
+            backtest_config=(
+                backtest_config
+            ),
+            periods_per_year=(
+                periods_per_year
+            ),
+        )
+
+        # =====================================================
+        # 8. RECORD FOLD
         # =====================================================
 
         fold = WalkForwardFold(
             fold=fold_number,
 
-            train_start=train_data.index[0],
-            train_end=train_data.index[-1],
+            train_start=(
+                train_data.index[0]
+            ),
 
-            test_start=test_data.index[0],
-            test_end=test_data.index[-1],
+            train_end=(
+                train_data.index[-1]
+            ),
 
-            selected_candidate=selected,
+            test_start=(
+                test_data.index[0]
+            ),
 
-            test_metrics=test_metrics,
+            test_end=(
+                test_data.index[-1]
+            ),
 
-            test_backtest=test_backtest,
+            selected_candidate=(
+                selected
+            ),
+
+            test_metrics=(
+                test_metrics
+            ),
+
+            test_backtest=(
+                test_backtest
+            ),
         )
 
-        folds.append(fold)
+        folds.append(
+            fold
+        )
 
         summary_rows.append(
             _build_summary_row(
@@ -602,12 +793,18 @@ def walk_forward_optimize_double_dip(
         )
 
         # =====================================================
-        # 6. ADVANCE THROUGH TIME
+        # 9. ADVANCE
         # =====================================================
 
         fold_number += 1
 
-        test_start_position += step_bars
+        test_start_position += (
+            step_bars
+        )
+
+    # =========================================================
+    # 10. REQUIRE AT LEAST ONE FOLD
+    # =========================================================
 
     if not folds:
         raise ValueError(
@@ -615,7 +812,15 @@ def walk_forward_optimize_double_dip(
             "complete evaluation folds"
         )
 
+    # =========================================================
+    # 11. BUILD FINAL HUMAN-READABLE SUMMARY
+    # =========================================================
+
     return WalkForwardResult(
-        folds=tuple(folds),
-        summary=pd.DataFrame(summary_rows),
+        folds=tuple(
+            folds
+        ),
+        summary=pd.DataFrame(
+            summary_rows
+        ),
     )

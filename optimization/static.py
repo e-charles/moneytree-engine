@@ -5,24 +5,49 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from numpy.typing import NDArray
 from ta.momentum import RSIIndicator
 
-from strats.double_dip import rsi_double_dip_targets
+from strats.double_dip import (
+    rsi_double_dip_targets,
+)
 
-from backtesting.engine import BacktestConfig, run_backtest, validate_backtest_config, validate_backtest_market_data
+from backtesting.engine import (
+    BacktestConfig,
+    run_backtest,
+    validate_backtest_config,
+)
 
-from backtesting.metrics import calculate_metrics
+from backtesting.metrics import (
+    calculate_metrics,
+)
 
-from optimization.search_space import DoubleDipParameters, DoubleDipSearchSpace
+from optimization.search_space import (
+    DoubleDipParameters,
+    DoubleDipSearchSpace,
+)
 
 
-def _validate_market_data(data: pd.DataFrame) -> None:
+FloatArray = NDArray[np.float64]
+
+
+def _validate_market_data(
+    data: pd.DataFrame,
+) -> None:
     """
-    Validate the market data required by the optimizer.
+    Validate market data before entering the numerical
+    optimization pipeline.
+
+    Validation occurs once per optimization window.
+
+    After validation, Open and Close are converted to NumPy
+    arrays and reused by every candidate.
     """
 
     if data.empty:
-        raise ValueError("data cannot be empty")
+        raise ValueError(
+            "data cannot be empty"
+        )
 
     required_columns = {
         "Open",
@@ -35,7 +60,8 @@ def _validate_market_data(data: pd.DataFrame) -> None:
 
     if missing:
         raise ValueError(
-            f"Missing required columns: {sorted(missing)}"
+            "Missing required columns: "
+            f"{sorted(missing)}"
         )
 
     if data.index.has_duplicates:
@@ -48,12 +74,18 @@ def _validate_market_data(data: pd.DataFrame) -> None:
             "data index must be sorted in ascending order"
         )
 
-    if data[["Open", "Close"]].isna().any().any():
+    prices = data[
+        ["Open", "Close"]
+    ]
+
+    if prices.isna().any().any():
         raise ValueError(
             "Open and Close cannot contain NaN values"
         )
 
-    if (data[["Open", "Close"]] <= 0).any().any():
+    if (
+        prices <= 0
+    ).any().any():
         raise ValueError(
             "Open and Close prices must be greater than zero"
         )
@@ -62,83 +94,116 @@ def _validate_market_data(data: pd.DataFrame) -> None:
 def _calculate_rsi(
     close: pd.Series,
     rsi_length: int,
-) -> pd.Series:
+) -> FloatArray:
     """
-    Calculate RSI for one candidate configuration.
+    Calculate one RSI series and immediately convert it to
+    the optimizer's NumPy representation.
+
+    The external RSI library currently operates on pandas,
+    but the optimizer does not retain the resulting Series.
     """
 
-    return RSIIndicator(
+    rsi = RSIIndicator(
         close=close,
         window=rsi_length,
     ).rsi()
 
+    return rsi.to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
 
 def evaluate_double_dip_candidate_from_rsi(
-    data: pd.DataFrame,
-    rsi: pd.Series,
+    open_prices: FloatArray,
+    close_prices: FloatArray,
+    rsi: FloatArray,
     parameters: DoubleDipParameters,
-    backtest_config: BacktestConfig | None = None,
+    backtest_config: BacktestConfig,
     periods_per_year: int = 252,
-    inputs_prevalidated: bool = False
 ) -> dict[str, float | int]:
     """
-    Evaluate one Double Dip parameter configuration using an already-calculated RSI series
+    Evaluate one Double Dip parameter configuration.
 
-    Returns one flat dictionary suitable for conversion
-    into a DataFrame row.
+    This function is part of the optimizer's trusted numerical
+    fast path.
+
+    All market data has already been validated and converted
+    to NumPy before this function is called.
+
+    Returns one flat dictionary suitable for inclusion in the
+    final optimization result DataFrame.
     """
 
-    if backtest_config is None:
-        backtest_config = BacktestConfig()
+    # =========================================================
+    # 1. STRATEGY
+    # =========================================================
 
-    # ---------------------------------------------------------
-    # Strategy
-    # ---------------------------------------------------------
-
-    target_at_close = rsi_double_dip_targets(
-        rsi=rsi,
-        oversold=parameters.oversold,
-        overbought=parameters.overbought,
-        max_bars_between_dips=(
-            parameters.max_bars_between_dips
-        ),
+    target_at_close = (
+        rsi_double_dip_targets(
+            rsi=rsi,
+            oversold=parameters.oversold,
+            overbought=parameters.overbought,
+            max_bars_between_dips=(
+                parameters.max_bars_between_dips
+            ),
+        )
     )
 
-    # ---------------------------------------------------------
-    # Backtest
-    # ---------------------------------------------------------
+    # =========================================================
+    # 2. BACKTEST
+    # =========================================================
 
     result = run_backtest(
-        data=data,
+        open_prices=open_prices,
+        close_prices=close_prices,
         target_at_close=target_at_close,
         config=backtest_config,
-        inputs_prevalidated=inputs_prevalidated
+
+        # Market arrays, strategy output, and config are trusted
+        # inside the optimizer candidate loop.
+        inputs_prevalidated=True,
     )
 
-    # ---------------------------------------------------------
-    # Metrics
-    # ---------------------------------------------------------
+    # =========================================================
+    # 3. METRICS
+    # =========================================================
 
     metrics = calculate_metrics(
         equity=result.equity,
         trades=result.trades,
         periods_per_year=periods_per_year,
+
+        # BacktestResult is produced by our own trusted engine,
+        # so repeating validation here is unnecessary.
+        inputs_prevalidated=True,
     )
 
-    # ---------------------------------------------------------
-    # Flatten result
-    # ---------------------------------------------------------
+    # =========================================================
+    # 4. FLATTEN RESULT
+    # =========================================================
 
     return {
-        "rsi_length": parameters.rsi_length,
-        "oversold": parameters.oversold,
-        "overbought": parameters.overbought,
+        "rsi_length": (
+            parameters.rsi_length
+        ),
+
+        "oversold": (
+            parameters.oversold
+        ),
+
+        "overbought": (
+            parameters.overbought
+        ),
+
         "max_bars_between_dips": (
             parameters.max_bars_between_dips
         ),
-        **metrics, # should destructire metrics
-        "final_equity": float(
-        result.equity.iloc[-1]
+
+        **metrics,
+
+        "final_equity": (
+            result.final_equity
         ),
     }
 
@@ -152,21 +217,42 @@ def optimize_double_dip(
     """
     Evaluate every valid RSI Double Dip candidate.
 
-    IMPORTANT:
-    This function does NOT select a winner.
+    Processing architecture
+    -----------------------
 
-    It returns the complete result table so that candidate
-    eligibility, ranking, robustness, and walk-forward
-    selection can be handled independently.
+        pandas market data
+              |
+              v
+        validate once
+              |
+              v
+        convert prices to NumPy
+              |
+              v
+        build NumPy RSI cache
+              |
+              v
+        evaluate candidates entirely with NumPy
+              |
+              v
+        create one final pandas DataFrame
+
+    IMPORTANT
+    ---------
+    This function does not select a winner.
+
+    It returns the complete raw optimization result table so
+    eligibility, robustness, ranking, and walk-forward selection
+    remain independent concerns.
     """
 
-    # ---------------------------------------------------------
-    # 1. Validate market data
-    # ---------------------------------------------------------
+    # =========================================================
+    # 1. VALIDATE INPUTS ONCE
+    # =========================================================
 
-    _validate_market_data(data)
-
-    
+    _validate_market_data(
+        data
+    )
 
     if periods_per_year <= 0:
         raise ValueError(
@@ -176,35 +262,61 @@ def optimize_double_dip(
     if backtest_config is None:
         backtest_config = BacktestConfig()
 
-    validate_backtest_config(backtest_config)
+    validate_backtest_config(
+        backtest_config
+    )
 
-    # ---------------------------------------------------------
-    # 2. Generate every valid candidate
-    # ---------------------------------------------------------
+    # =========================================================
+    # 2. CONVERT MARKET DATA TO NUMPY ONCE
+    # =========================================================
+    #
+    # Every candidate uses exactly the same Open and Close
+    # arrays for this optimization window.
+    #
+    # Do not repeat this conversion inside the candidate loop.
+    # =========================================================
 
-    candidates = list(search_space.candidates())
+    open_prices = data[
+        "Open"
+    ].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
+    close_prices = data[
+        "Close"
+    ].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
+    # =========================================================
+    # 3. GENERATE CANDIDATES
+    # =========================================================
+
+    candidates = list(
+        search_space.candidates()
+    )
 
     if not candidates:
         raise ValueError(
             "search_space produced no valid candidates"
         )
 
-    # ---------------------------------------------------------
-    # 3. Find the unique RSI lengths
-    # ---------------------------------------------------------
-    #
-    # Many candidates share the same RSI length.
+    # =========================================================
+    # 4. FIND UNIQUE RSI LENGTHS
+    # =========================================================
     #
     # Example:
     #
     # RSI 14 / OS 25 / OB 70 / Gap 5
     # RSI 14 / OS 30 / OB 70 / Gap 5
-    # RSI 14 / OS 30 / OB 75 / Gap 10
+    # RSI 14 / OS 35 / OB 75 / Gap 10
     #
-    # All three use exactly the same RSI(14) series.
+    # All three candidates use the exact same RSI(14).
     #
-    # Therefore, calculate RSI(14) once rather than three times.
-    # ---------------------------------------------------------
+    # It should therefore be calculated once.
+    # =========================================================
 
     unique_rsi_lengths = sorted(
         {
@@ -213,61 +325,103 @@ def optimize_double_dip(
         }
     )
 
-    # ---------------------------------------------------------
-    # 4. Build RSI cache
-    # ---------------------------------------------------------
+    # =========================================================
+    # 5. BUILD NUMPY RSI CACHE
+    # =========================================================
 
-    rsi_cache: dict[int, pd.Series] = {}
+    close_series = data[
+        "Close"
+    ]
+
+    rsi_cache: dict[
+        int,
+        FloatArray,
+    ] = {}
 
     for rsi_length in unique_rsi_lengths:
-        rsi_cache[rsi_length] = _calculate_rsi(
-            close=data["Close"],
+
+        rsi_cache[
+            rsi_length
+        ] = _calculate_rsi(
+            close=close_series,
             rsi_length=rsi_length,
         )
 
-    # ---------------------------------------------------------
-    # 5. Evaluate every candidate
-    # ---------------------------------------------------------
+    # =========================================================
+    # 6. EVALUATE EVERY CANDIDATE
+    # =========================================================
+    #
+    # Everything inside this loop is now numerical.
+    #
+    # No:
+    #
+    # - DataFrames
+    # - Series
+    # - pandas validation
+    # - pandas target construction
+    # - pandas equity construction
+    # - pandas trade construction
+    # - pandas metric calculations
+    #
+    # are necessary per candidate.
+    # =========================================================
 
-    rows: list[dict[str, float | int]] = []
+    rows: list[
+        dict[str, float | int]
+    ] = []
 
     for parameters in candidates:
 
-        # Retrieve the already-calculated RSI series.
         rsi = rsi_cache[
             parameters.rsi_length
         ]
 
-        row = evaluate_double_dip_candidate_from_rsi(
-            data=data,
-            rsi=rsi,
-            parameters=parameters,
-            backtest_config=backtest_config,
-            periods_per_year=periods_per_year,
-            inputs_prevalidated=True
+        row = (
+            evaluate_double_dip_candidate_from_rsi(
+                open_prices=open_prices,
+                close_prices=close_prices,
+                rsi=rsi,
+                parameters=parameters,
+                backtest_config=backtest_config,
+                periods_per_year=periods_per_year,
+            )
         )
 
-        rows.append(row)
+        rows.append(
+            row
+        )
 
-    # ---------------------------------------------------------
-    # 6. Convert all candidate results into a DataFrame
-    # ---------------------------------------------------------
+    # =========================================================
+    # 7. CONVERT RESULTS TO PANDAS ONCE
+    # =========================================================
+    #
+    # Candidate evaluation remains NumPy-based.
+    #
+    # Pandas is reintroduced only after every candidate has
+    # finished so downstream research components can work with
+    # a convenient tabular representation.
+    # =========================================================
 
-    results = pd.DataFrame(rows)
+    results = pd.DataFrame(
+        rows
+    )
 
-    # ---------------------------------------------------------
-    # 7. Return RAW optimization results
-    # ---------------------------------------------------------
+    # =========================================================
+    # 8. RETURN RAW OPTIMIZATION RESULTS
+    # =========================================================
     #
     # Do NOT:
     #
     # - sort by Sharpe
-    # - pick highest return
+    # - select the highest-return candidate
     # - remove low-trade candidates
     # - replace infinite profit factors
+    # - apply neighborhood robustness
+    # - apply eligibility rules
     # - select a winner
     #
-    # Those responsibilities belong to selection.py.
-    # ---------------------------------------------------------
+    # Those responsibilities belong to robustness.py and
+    # selection.py.
+    # =========================================================
 
     return results
