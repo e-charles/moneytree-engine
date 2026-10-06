@@ -1,0 +1,7 @@
+Boundary Leakage
+
+A decision for bar i may only use information available at or before the defined signal timestamp, and portfolio performance is measured only for bars belonging to the evaluation region.
+
+Rule 1: Indicators may use warm-up history 
+Rule 2: Portfolio state starts at eval_start 
+Rule 3: Metrics only use [eval_start, eval_end)

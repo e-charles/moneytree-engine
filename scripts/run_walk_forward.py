@@ -63,9 +63,9 @@ walk_forward_config = WalkForwardConfig(
 
 neighborhood_config = NeighborhoodConfig(
     metric="sharpe",
-    min_neighbors=3,
-    relative_performance_floor=0.75,
-    include_diagonal_neighbors=False,
+    min_neighbors=1,
+    relative_performance_floor=0.45,
+    include_diagonal_neighbors=True,
 )
 
 
@@ -78,7 +78,7 @@ selection_config = SelectionConfig(
     ranking_metric="sharpe",
     max_allowed_drawdown=0.10,
     require_positive_return=True,
-    min_neighborhood_robustness=0.60,
+    min_neighborhood_robustness=0.50,
 )
 
 

@@ -6,6 +6,28 @@ from dataclasses import dataclass
 from itertools import product
 from typing import Iterator
 
+@dataclass(frozen=True)
+class SMAParameters:
+    """
+    One complete RSI Double Dip parameter configuration.
+    """
+
+    rsi_length: int
+    oversold: float
+    overbought: float
+    max_bars_between_dips: int
+
+@dataclass(frozen=True)
+class RSIParameters:
+    """
+    One complete RSI Double Dip parameter configuration.
+    """
+
+    rsi_length: int
+    oversold: float
+    overbought: float
+    max_bars_between_dips: int
+
 
 @dataclass(frozen=True)
 class DoubleDipParameters:
@@ -139,6 +161,73 @@ class DoubleDipSearchSpace:
 
 
 def default_double_dip_search_space() -> DoubleDipSearchSpace:
+    """
+    Return the default RSI Double Dip research search space.
+
+    This search space is intentionally constrained while the
+    optimization framework is being developed and validated.
+    """
+
+    return DoubleDipSearchSpace(
+        rsi_lengths=tuple(range(5, 31)),
+        oversold_levels=(
+            20.0,
+            25.0,
+            30.0,
+            35.0,
+        ),
+        overbought_levels=(
+            65.0,
+            70.0,
+            75.0,
+            80.0,
+        ),
+        max_bars_between_dips=(
+            3,
+            5,
+            7,
+            10,
+            15,
+        ),
+    )
+
+
+
+
+def default_rsi_search_space() -> DoubleDipSearchSpace:
+    """
+    Return the default RSI Double Dip research search space.
+
+    This search space is intentionally constrained while the
+    optimization framework is being developed and validated.
+    """
+
+    return DoubleDipSearchSpace(
+        rsi_lengths=tuple(range(5, 31)),
+        oversold_levels=(
+            20.0,
+            25.0,
+            30.0,
+            35.0,
+        ),
+        overbought_levels=(
+            65.0,
+            70.0,
+            75.0,
+            80.0,
+        ),
+        max_bars_between_dips=(
+            3,
+            5,
+            7,
+            10,
+            15,
+        ),
+    )
+
+
+
+def default_sma_search_space() -> DoubleDipSearchSpace:
     """
     Return the default RSI Double Dip research search space.
 

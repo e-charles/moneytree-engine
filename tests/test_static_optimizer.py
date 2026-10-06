@@ -1,3 +1,5 @@
+# tests/test_static_optimizer
+
 import numpy as np
 import pandas as pd
 import pytest

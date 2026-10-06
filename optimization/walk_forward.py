@@ -1,3 +1,5 @@
+# optimization/walk_forward
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,6 +26,8 @@ from optimization.robustness import (
 )
 
 from optimization.search_space import (
+    SMAParameters,
+    RSIParameters,
     DoubleDipParameters,
     DoubleDipSearchSpace,
 )
@@ -217,7 +221,34 @@ def _validate_market_data(
         )
 
 
-def _evaluate_test_window(
+def _evaluate_sma_test_window(
+    data: pd.DataFrame,
+    test_start_position: int,
+    test_end_position: int,
+    parameters: SMAParameters,
+    backtest_config: BacktestConfig,
+    periods_per_year: int,
+) -> tuple[
+    dict[str, float | int],
+    BacktestResult,
+]:
+    return
+    
+def _evaluate_rsi_test_window(
+    data: pd.DataFrame,
+    test_start_position: int,
+    test_end_position: int,
+    parameters: RSIParameters,
+    backtest_config: BacktestConfig,
+    periods_per_year: int,
+) -> tuple[
+    dict[str, float | int],
+    BacktestResult,
+]:
+    return 
+
+
+def _evaluate_double_dip_test_window(
     data: pd.DataFrame,
     test_start_position: int,
     test_end_position: int,
@@ -232,7 +263,12 @@ def _evaluate_test_window(
     Evaluate frozen parameters on one unseen test window.
 
     Historical Close data through the test window is used to
-    calculate RSI and rebuild strategy state.
+    calculate RSI with valid historical indicator context.
+
+    Only test-window RSI values are supplied to the strategy,
+    so strategy state begins fresh at the test boundary.
+
+    The backtest also begins with fresh portfolio state.
 
     No data after test_end_position is used.
 
@@ -278,13 +314,17 @@ def _evaluate_test_window(
     ]
 
     # =========================================================
-    # 2. CALCULATE RSI
+    # 2. CALCULATE RSI USING AVAIL HISTORY
     # =========================================================
+    #
+    # Indicator can cross test boundary but strategy cannot
     #
     # RSIIndicator currently uses pandas, so this is the one
     # remaining pandas calculation in the test numerical path.
     #
     # Immediately convert the result to NumPy.
+    #
+    # Only test-period RSI values are passed to the strategy
     # =========================================================
 
     rsi = RSIIndicator(
@@ -295,27 +335,23 @@ def _evaluate_test_window(
         copy=False,
     )
 
+    test_rsi = rsi[
+        test_start_position:test_end_position
+    ]
+
     # =========================================================
-    # 3. REBUILD STRATEGY STATE WITH NUMPY
-    # =========================================================
-    #
-    # The strategy runs over the historical RSI context so state
-    # immediately before the test window is reconstructed.
+    # 3. GENERATE TEST STRATEGY TARGETS
     # =========================================================
 
-    target_with_history = (
-        rsi_double_dip_targets(
-            rsi=rsi,
-            oversold=parameters.oversold,
-            overbought=parameters.overbought,
-            max_bars_between_dips=(
-                parameters.max_bars_between_dips
-            ),
-        )
+    test_target = rsi_double_dip_targets(
+        rsi=test_rsi,
+        oversold=parameters.oversold,
+        overbought=parameters.overbought,
+        max_bars_between_dips=parameters.max_bars_between_dips
     )
 
     # =========================================================
-    # 4. EXTRACT TEST-WINDOW NUMPY ARRAYS
+    # 4. EXTRACT TEST-WINDOW MARKET DATA AS NUMPY ARRAYS
     # =========================================================
 
     open_prices = data[
@@ -335,10 +371,6 @@ def _evaluate_test_window(
         dtype=np.float64,
         copy=False,
     )
-
-    test_target = target_with_history[
-        test_start_position:test_end_position
-    ]
 
     # =========================================================
     # 5. RUN OUT-OF-SAMPLE BACKTEST
@@ -723,7 +755,7 @@ def walk_forward_optimize_double_dip(
         (
             test_metrics,
             test_backtest,
-        ) = _evaluate_test_window(
+        ) = _evaluate_double_dip_test_window(
             data=data,
             test_start_position=(
                 test_start_position

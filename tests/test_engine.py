@@ -1,241 +1,444 @@
-import pandas as pd
-# import sys
-# from pathlib import Path
+import numpy as np
 import pytest
 
-# Adds the parent directory (/workspaces/moneytree-optimizer) to the path
-# sys.path.append(str(Path(__file__).resolve().parent.parent))
+from backtesting.engine import (
+    BacktestConfig,
+    run_backtest,
+)
 
-from backtesting.engine import BacktestConfig, run_backtest
+
+# ============================================================
+# Helpers
+# ============================================================
 
 
-def make_data(
-        opens: list[float],
-        closes: list[float],
-        index: pd.Index | None = None 
-) -> pd.DataFrame: 
-    """Minimal market-data frame sufficient for backtesting"""
-    if index is None: 
-            index = pd.date_range("2025-01-01", periods=len(opens), freq="D")
-
-    return pd.DataFrame(
-         {
-              "Open": opens,
-              "Close": closes
-         }, 
-         index=index
+def make_prices(
+    opens: list[float],
+    closes: list[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Create NumPy Open and Close arrays for engine tests.
+    """
+    return (
+        np.asarray(
+            opens,
+            dtype=np.float64,
+        ),
+        np.asarray(
+            closes,
+            dtype=np.float64,
+        ),
     )
 
+
 def make_target(
-        data: pd.DataFrame,
-        values: list[int | float]
-) -> pd.Series: 
-     """Create a close-based target series aligned with market-data"""
-     return pd.Series(values, index=data.index, name="target_at_close")
+    values: list[int],
+) -> np.ndarray:
+    """
+    Create a close-based target array.
+    """
+    return np.asarray(
+        values,
+        dtype=np.int8,
+    )
 
 
 def no_cost_config(
-    intial_cash: float = 100_000.0,
-    close_open_position_at_end: bool = False, 
+    initial_cash: float = 100_000.0,
+    close_open_position_at_end: bool = False,
 ) -> BacktestConfig:
     return BacktestConfig(
-         initial_cash=intial_cash,
-         commission_rate=0,
-         slippage_rate=0,
-         close_open_position_at_end=close_open_position_at_end
+        initial_cash=initial_cash,
+        commission_rate=0.0,
+        slippage_rate=0.0,
+        close_open_position_at_end=(
+            close_open_position_at_end
+        ),
     )
 
-     
-# Execution timing
+
+# ============================================================
+# EXECUTION TIMING
+# ============================================================
+
+
 def test_close_signal_executes_at_following_open() -> None:
-   data = make_data(
-        opens= [100.0, 110.0, 120.0],
-        closes= [100.0, 115.0, 125.0]
-   )
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 110.0, 120.0],
+        closes=[100.0, 115.0, 125.0],
+    )
 
-   # strategy decides long at bar 0's close 
-   # engine shifts internally and buys at bar 1's open = 110
+    # Strategy decides long at bar 0 Close.
+    #
+    # Engine shifts the target internally:
+    #
+    # target[0] -> position_at_open[1]
+    #
+    # Therefore the purchase occurs at bar 1 Open = 110.
+    target_at_close = make_target(
+        [1, 1, 1]
+    )
 
-   target_at_close = make_target(data, [1, 1, 1])
+    result = run_backtest(
+        open_prices,
+        close_prices,
+        target_at_close,
+        no_cost_config(),
+    )
 
-   result = run_backtest(data, 
-                         target_at_close, 
-                         no_cost_config())
+    assert result.positions.tolist() == [
+        0,
+        1,
+        1,
+    ]
 
-   assert result.positions.tolist() == [0, 1, 1]
-   assert result.trades.empty 
+    # Position remains open because forced final liquidation
+    # is disabled.
+    assert result.trades.count == 0
 
-   # no order can execute on the first bar since no prior signal exists 
-   assert result.equity.iloc[0] == pytest.approx(100_000.0)
+    # No order can execute on the first bar because no prior
+    # close-based target exists.
+    assert result.equity[0] == pytest.approx(
+        100_000.0
+    )
 
-   # buys at 110, then mark to the same bar's close of 115 
-   # units = 100,000 / 110
-   expected_equity_bar_1 = 100_000.0 * (115.0/110.0)
-   assert result.equity.iloc[1] == pytest.approx(expected_equity_bar_1)
+    # Buy at 110 and mark the position at the same bar's
+    # Close of 115.
+    expected_equity_bar_1 = (
+        100_000.0
+        * (115.0 / 110.0)
+    )
+
+    assert result.equity[1] == pytest.approx(
+        expected_equity_bar_1
+    )
+
+
+def test_first_bar_cannot_execute_prior_signal() -> None:
+    """
+    The engine receives an independent backtest window.
+
+    There is no target before target_at_close[0], so the first
+    bar must always begin flat.
+
+    This behavior is important at walk-forward test boundaries.
+    """
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 100.0],
+        closes=[100.0, 100.0],
+    )
+
+    target_at_close = make_target(
+        [1, 1]
+    )
+
+    result = run_backtest(
+        open_prices,
+        close_prices,
+        target_at_close,
+        no_cost_config(),
+    )
+
+    assert result.positions[0] == 0
+    assert result.positions[1] == 1
+
+    assert result.equity[0] == pytest.approx(
+        100_000.0
+    )
+
 
 def test_last_bar_close_signal_cannot_execute() -> None:
-     data = make_data(
-          opens= [100.0, 100.0, 100.0],
-          closes= [100.0, 100.0, 100.0]
-     )
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 100.0, 100.0],
+        closes=[100.0, 100.0, 100.0],
+    )
 
-     # turns long only at the last close 
-     # there is no following open bar so no trade should execute 
-     target_at_close = make_target(data, [0, 0, 1])
-
-     result = run_backtest(
-          data, 
-          target_at_close,
-          no_cost_config()
-     ) 
-
-     assert result.positions.tolist() == [0, 0, 0]
-     assert result.trades.empty 
-     assert result.equity.iloc[-1] == pytest.approx(100_000.0)
-
-def test_holding_target_does_not_create_multiple_entries() -> None: 
-    data = make_data(
-            opens=[100.0, 100.0, 100.0, 100.0, 100.0],
-            closes=[100.0, 100.0, 100.0, 100.0, 100.0],
-        )
-
-    # Signals are evaluated at Close:
-    # bar 0 says long -> buy at bar 1 open
-    # bars 1 and 2 remain long -> hold
-    # bar 3 says flat -> sell at bar 4 open
-    target_at_close = make_target(data, [1, 1, 1, 0, 0])
+    # Turns long only at the final Close.
+    #
+    # There is no following Open, so no trade can execute.
+    target_at_close = make_target(
+        [0, 0, 1]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         no_cost_config(),
     )
 
+    assert result.positions.tolist() == [
+        0,
+        0,
+        0,
+    ]
 
-    assert result.positions.tolist() == [0, 1, 1, 1, 0]
-    assert len(result.trades) == 1
+    assert result.trades.count == 0
 
-    trade = result.trades.iloc[0]
-    assert trade["entry_time"] == data.index[1]
-    assert trade["exit_time"] == data.index[4]
-    assert trade["direction"] == "long"
+    assert result.equity[-1] == pytest.approx(
+        100_000.0
+    )
 
 
+def test_holding_target_does_not_create_multiple_entries() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+    )
 
-# Accounting 
-def test_initial_equity_does_not_double_after_pruchase() -> None: 
-    data = make_data(
+    # bar 0 Close -> long
+    # bar 1 Open  -> enter
+    #
+    # bars 1 and 2 continue targeting long.
+    #
+    # bar 3 Close -> flat
+    # bar 4 Open  -> exit
+    target_at_close = make_target(
+        [1, 1, 1, 0, 0]
+    )
+
+    result = run_backtest(
+        open_prices,
+        close_prices,
+        target_at_close,
+        no_cost_config(),
+    )
+
+    assert result.positions.tolist() == [
+        0,
+        1,
+        1,
+        1,
+        0,
+    ]
+
+    assert result.trades.count == 1
+
+    assert result.trades.entry_bars[0] == 1
+    assert result.trades.exit_bars[0] == 4
+
+
+# ============================================================
+# ACCOUNTING
+# ============================================================
+
+
+def test_initial_equity_does_not_double_after_purchase() -> None:
+    open_prices, close_prices = make_prices(
         opens=[100.0, 100.0],
         closes=[100.0, 100.0],
     )
 
-    # Signal at close of first bar; enter at second bar open.
-    target_at_close = make_target(data, [1, 1])
+    target_at_close = make_target(
+        [1, 1]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         no_cost_config(),
     )
 
-    assert result.positions.tolist() == [0, 1]
+    assert result.positions.tolist() == [
+        0,
+        1,
+    ]
 
-    # At entry, all cash is correctly converted into shares.
-    # Because Open == Close and fees are zero, equity remains unchanged.
-    assert result.equity.iloc[1] == pytest.approx(100_000.0)
-
-
-
-
-def test_profitable_trade_increases_final_equity_correctly() -> None: 
-    data = make_data(
-        opens=[100.0, 100.0, 120.0, 120.0],
-        closes=[100.0, 100.0, 120.0, 120.0],
+    # All cash is converted into shares.
+    #
+    # Since Open == Close and there are no costs, equity must
+    # remain exactly equal to initial capital.
+    assert result.equity[1] == pytest.approx(
+        100_000.0
     )
 
-    # Signal long at bar 0 close -> enter at bar 1 open = 100.
-    # Signal flat at bar 2 close -> exit at bar 3 open = 120.
-    target_at_close = make_target(data, [1, 1, 0, 0])
+
+def test_profitable_trade_increases_final_equity_correctly() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            120.0,
+            120.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            120.0,
+            120.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         no_cost_config(),
     )
 
-    assert len(result.trades) == 1
+    assert result.trades.count == 1
 
-    trade = result.trades.iloc[0]
-
-    # $100,000 buys 1,000 units at 100.
-    # Selling 1,000 units at 120 returns $120,000.
-    assert trade["entry_price"] == pytest.approx(100.0)
-    assert trade["exit_price"] == pytest.approx(120.0)
-    assert trade["units"] == pytest.approx(1_000.0)
-    assert trade["gross_pnl"] == pytest.approx(20_000.0)
-    assert trade["net_pnl"] == pytest.approx(20_000.0)
-    assert result.equity.iloc[-1] == pytest.approx(120_000.0)
-
-
-
-
-def test_losing_trade_decreases_final_equity_correctly() -> None: 
-    data = make_data(
-        opens=[100.0, 100.0, 80.0, 80.0],
-        closes=[100.0, 100.0, 80.0, 80.0],
+    assert result.trades.entry_prices[0] == pytest.approx(
+        100.0
     )
 
-    # Enter at bar 1 Open = 100 and exit at bar 3 Open = 80.
-    target_at_close = make_target(data, [1, 1, 0, 0])
+    assert result.trades.exit_prices[0] == pytest.approx(
+        120.0
+    )
+
+    assert result.trades.units[0] == pytest.approx(
+        1_000.0
+    )
+
+    assert result.trades.gross_pnl[0] == pytest.approx(
+        20_000.0
+    )
+
+    assert result.trades.net_pnl[0] == pytest.approx(
+        20_000.0
+    )
+
+    assert result.equity[-1] == pytest.approx(
+        120_000.0
+    )
+
+    assert result.final_equity == pytest.approx(
+        120_000.0
+    )
+
+
+def test_losing_trade_decreases_final_equity_correctly() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            80.0,
+            80.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            80.0,
+            80.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         no_cost_config(),
     )
 
-    assert len(result.trades) == 1
+    assert result.trades.count == 1
 
-    trade = result.trades.iloc[0]
-
-    assert trade["gross_pnl"] == pytest.approx(-20_000.0)
-    assert trade["net_pnl"] == pytest.approx(-20_000.0)
-    assert result.equity.iloc[-1] == pytest.approx(80_000.0)
-
-
-def test_selling_restores_postion_to_flat() -> None: 
-    data = make_data(
-        opens=[100.0, 100.0, 100.0, 100.0],
-        closes=[100.0, 100.0, 100.0, 100.0],
+    assert result.trades.gross_pnl[0] == pytest.approx(
+        -20_000.0
     )
 
-    # Long signal at bar 0 -> buy at bar 1 Open.
-    # Flat signal at bar 2 -> sell at bar 3 Open.
-    target_at_close = make_target(data, [1, 1, 0, 0])
+    assert result.trades.net_pnl[0] == pytest.approx(
+        -20_000.0
+    )
+
+    assert result.equity[-1] == pytest.approx(
+        80_000.0
+    )
+
+    assert result.final_equity == pytest.approx(
+        80_000.0
+    )
+
+
+def test_selling_restores_position_to_flat() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         no_cost_config(),
     )
 
-    assert result.positions.tolist() == [0, 1, 1, 0]
-    assert result.positions.iloc[-1] == 0
-    assert result.equity.iloc[-1] == pytest.approx(100_000.0)
+    assert result.positions.tolist() == [
+        0,
+        1,
+        1,
+        0,
+    ]
 
+    assert result.positions[-1] == 0
 
-# Execution costs 
-def test_buy_slippage_worsens_entry_price() -> None: 
-    data = make_data(
-        opens=[100.0, 100.0, 100.0, 100.0],
-        closes=[100.0, 100.0, 100.0, 100.0],
+    assert result.equity[-1] == pytest.approx(
+        100_000.0
     )
 
-    # Enter at bar 1; exit at bar 3.
-    target_at_close = make_target(data, [1, 1, 0, 0])
+
+# ============================================================
+# EXECUTION COSTS
+# ============================================================
+
+
+def test_buy_slippage_worsens_entry_price() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         BacktestConfig(
             initial_cash=100_000.0,
@@ -245,24 +448,40 @@ def test_buy_slippage_worsens_entry_price() -> None:
         ),
     )
 
-    trade = result.trades.iloc[0]
+    assert result.trades.count == 1
 
-    # Buy fill = quoted Open * (1 + slippage).
-    assert trade["entry_price"] == pytest.approx(101.0)
-
-    # Without slippage, it would have entered at 100.
-    assert trade["entry_price"] > 100.0
-
-
-def test_sell_slippage_worsens_exit_price() -> None: 
-    data = make_data(
-        opens=[100.0, 100.0, 100.0, 100.0],
-        closes=[100.0, 100.0, 100.0, 100.0],
+    # Quoted Open = 100.
+    # 1% adverse buy slippage -> 101.
+    assert result.trades.entry_prices[0] == pytest.approx(
+        101.0
     )
-    target_at_close = make_target(data, [1, 1, 0, 0])
+
+    assert result.trades.entry_prices[0] > 100.0
+
+
+def test_sell_slippage_worsens_exit_price() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         BacktestConfig(
             initial_cash=100_000.0,
@@ -272,22 +491,30 @@ def test_sell_slippage_worsens_exit_price() -> None:
         ),
     )
 
-    trade = result.trades.iloc[0]
+    assert result.trades.count == 1
 
-    # Sell fill = quoted Open * (1 - slippage).
-    assert trade["exit_price"] == pytest.approx(99.0)
-    assert trade["exit_price"] < 100.0
+    # Quoted Open = 100.
+    # 1% adverse sell slippage -> 99.
+    assert result.trades.exit_prices[0] == pytest.approx(
+        99.0
+    )
+
+    assert result.trades.exit_prices[0] < 100.0
 
 
-def test_entry_commission_reduces_equity() -> None: 
-    data = make_data(
+def test_entry_commission_reduces_equity() -> None:
+    open_prices, close_prices = make_prices(
         opens=[100.0, 100.0],
         closes=[100.0, 100.0],
     )
-    target_at_close = make_target(data, [1, 1])
+
+    target_at_close = make_target(
+        [1, 1]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         BacktestConfig(
             initial_cash=100_000.0,
@@ -297,32 +524,46 @@ def test_entry_commission_reduces_equity() -> None:
         ),
     )
 
-    # Entry notional is sized to ensure:
-    #
-    # entry_notional + entry_fee = $100,000
-    #
-    # entry_notional = 100,000 / 1.001
-    # entry fee = entry_notional * 0.001
-    entry_notional = 100_000.0 / 1.001
-    expected_equity = entry_notional
-
-    assert result.positions.iloc[1] == 1
-    assert result.equity.iloc[1] == pytest.approx(expected_equity)
-
-    # This is approximately a $99.90 reduction, not exactly $100,
-    # because the engine sizes the purchase to include commission.
-    assert result.equity.iloc[1] < 100_000.0
-
-
-def test_exit_commission_reduces_equity() -> None: 
-    data = make_data(
-        opens=[100.0, 100.0, 100.0, 100.0],
-        closes=[100.0, 100.0, 100.0, 100.0],
+    entry_notional = (
+        100_000.0 / 1.001
     )
-    target_at_close = make_target(data, [1, 1, 0, 0])
+
+    expected_equity = (
+        entry_notional
+    )
+
+    assert result.positions[1] == 1
+
+    assert result.equity[1] == pytest.approx(
+        expected_equity
+    )
+
+    assert result.equity[1] < 100_000.0
+
+
+def test_exit_commission_reduces_equity() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
         BacktestConfig(
             initial_cash=100_000.0,
@@ -332,246 +573,702 @@ def test_exit_commission_reduces_equity() -> None:
         ),
     )
 
-    assert len(result.trades) == 1
-    trade = result.trades.iloc[0]
-   
+    assert result.trades.count == 1
 
-    expected_entry_notional = 100_000.0 / 1.001
-    expected_entry_fee = expected_entry_notional * 0.001
-    expected_exit_fee = expected_entry_notional * 0.001
+    expected_entry_notional = (
+        100_000.0 / 1.001
+    )
 
-    assert trade["entry_price"] == pytest.approx(100.0)
-    assert trade["exit_price"] == pytest.approx(100.0)
-    assert trade["gross_pnl"] == pytest.approx(0.0)
-    assert trade["fees"] == pytest.approx(expected_entry_fee + expected_exit_fee)
-    assert trade["net_pnl"] == pytest.approx(-(expected_entry_fee + expected_exit_fee))
+    expected_entry_fee = (
+        expected_entry_notional
+        * 0.001
+    )
 
-    expected_final_equity = (expected_entry_notional - expected_exit_fee)
+    expected_exit_fee = (
+        expected_entry_notional
+        * 0.001
+    )
 
-    assert result.positions.tolist() ==[0, 1, 1, 0]
-    assert result.equity.iloc[-1] == pytest.approx(expected_final_equity)
+    expected_total_fees = (
+        expected_entry_fee
+        + expected_exit_fee
+    )
 
-    # entry and exit loses money 
-    assert result.equity.iloc[-1] < result.equity.iloc[1]
-    assert result.equity.iloc[-1] < 100_000.0
+    expected_final_equity = (
+        expected_entry_notional
+        - expected_exit_fee
+    )
+
+    assert result.trades.entry_prices[0] == pytest.approx(
+        100.0
+    )
+
+    assert result.trades.exit_prices[0] == pytest.approx(
+        100.0
+    )
+
+    assert result.trades.gross_pnl[0] == pytest.approx(
+        0.0
+    )
+
+    assert result.trades.fees[0] == pytest.approx(
+        expected_total_fees
+    )
+
+    assert result.trades.net_pnl[0] == pytest.approx(
+        -expected_total_fees
+    )
+
+    assert result.positions.tolist() == [
+        0,
+        1,
+        1,
+        0,
+    ]
+
+    assert result.equity[-1] == pytest.approx(
+        expected_final_equity
+    )
+
+    assert result.equity[-1] < result.equity[1]
+    assert result.equity[-1] < 100_000.0
 
 
+# ============================================================
+# TRADE LIFECYCLE
+# ============================================================
 
-# # Lifecycle 
+
 def test_target_exit_records_completed_trade() -> None:
-    data = make_data(
-        opens=[100.0, 110.0, 120.0, 130.0],
-        closes=[100.0, 115.0, 125.0, 135.0],
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            110.0,
+            120.0,
+            130.0,
+        ],
+        closes=[
+            100.0,
+            115.0,
+            125.0,
+            135.0,
+        ],
     )
 
-    target_at_close = make_target(data, [1, 1, 0, 0])
+    target_at_close = make_target(
+        [1, 1, 0, 0]
+    )
 
-    # Enter at bar 1; exit at bar 3.
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
-        no_cost_config()
+        no_cost_config(),
     )
 
-    assert result.positions.tolist() == [0, 1, 1, 0]
-    assert len(result.trades) == 1
+    assert result.positions.tolist() == [
+        0,
+        1,
+        1,
+        0,
+    ]
 
-    trade = result.trades.iloc[0]
+    assert result.trades.count == 1
 
-    assert trade["entry_time"] == data.index[1]
-    assert trade["exit_time"] == data.index[3]
-    assert trade["entry_price"] == pytest.approx(110.0)
-    assert trade["exit_price"] == pytest.approx(130.0)
-    assert trade["direction"] == "long"
-    assert trade["exit_reason"] == "target"
+    # The numerical engine records bar positions rather than
+    # timestamps. Timestamp translation belongs to reporting.
+    assert result.trades.entry_bars[0] == 1
+    assert result.trades.exit_bars[0] == 3
 
-    units = 100_000.0 / 110.0
-    expected_pnl = ((130.0 - 110.0) * units)
+    assert result.trades.entry_prices[0] == pytest.approx(
+        110.0
+    )
 
-    assert trade["gross_pnl"] == pytest.approx(expected_pnl)
-    assert trade["net_pnl"] == pytest.approx(expected_pnl)
-    assert result.equity.iloc[-1] == pytest.approx(100_000.0 + expected_pnl)
+    assert result.trades.exit_prices[0] == pytest.approx(
+        130.0
+    )
 
+    # 0 = strategy target exit.
+    assert result.trades.exit_reasons[0] == 0
+
+    units = (
+        100_000.0 / 110.0
+    )
+
+    expected_pnl = (
+        (130.0 - 110.0)
+        * units
+    )
+
+    assert result.trades.gross_pnl[0] == pytest.approx(
+        expected_pnl
+    )
+
+    assert result.trades.net_pnl[0] == pytest.approx(
+        expected_pnl
+    )
+
+    assert result.trades.bars_held[0] == 2
+
+    assert result.equity[-1] == pytest.approx(
+        100_000.0 + expected_pnl
+    )
 
 
 def test_forced_final_liquidation_records_completed_trade() -> None:
-    data = make_data(
-            opens=[100.0, 110.0, 120.0],
-            closes=[100.0, 115.0, 125.0],
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            110.0,
+            120.0,
+        ],
+        closes=[
+            100.0,
+            115.0,
+            125.0,
+        ],
     )
-    
-    target_at_close = make_target(data, [1, 1, 1])
 
-    # Enter at bar 1; exit at bar 3.
+    target_at_close = make_target(
+        [1, 1, 1]
+    )
+
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
-        no_cost_config(close_open_position_at_end=True)
+        no_cost_config(
+            close_open_position_at_end=True
+        ),
     )
 
-    assert len(result.trades) == 1
+    assert result.trades.count == 1
 
-    trade = result.trades.iloc[0]
-
-    # entry is at open bar 1 
-    assert trade["entry_time"] == data.index[1]
-    assert trade["exit_price"] == pytest.approx(125.0)
-
-    units = 100_000.0 / 110.0
-    expected_pnl = ( (125.0 - 110.0) * units)
-
-    assert trade["net_pnl"] == pytest.approx(expected_pnl)
-    assert result.equity.iloc[-1] == pytest.approx( 100_000.0 + expected_pnl)
-
-    assert result.positions.iloc[-1] == 0 
-
-
-def test_forced_liquidation_has_exit_reason_equal_to_end_of_data() -> None:
-    data = make_data(
-            opens=[100.0, 110.0, 120.0],
-            closes=[100.0, 115.0, 125.0],
+    # Entry executes at bar 1 Open.
+    assert result.trades.entry_bars[0] == 1
+    assert result.trades.entry_prices[0] == pytest.approx(
+        110.0
     )
-    
-    target_at_close = make_target(data, [1, 1, 1])
 
-    # Enter at bar 1; exit at bar 3.
+    # Forced liquidation occurs at the final bar Close.
+    assert result.trades.exit_bars[0] == 2
+    assert result.trades.exit_prices[0] == pytest.approx(
+        125.0
+    )
+
+    units = (
+        100_000.0 / 110.0
+    )
+
+    expected_pnl = (
+        (125.0 - 110.0)
+        * units
+    )
+
+    assert result.trades.net_pnl[0] == pytest.approx(
+        expected_pnl
+    )
+
+    assert result.equity[-1] == pytest.approx(
+        100_000.0 + expected_pnl
+    )
+
+    assert result.final_equity == pytest.approx(
+        result.equity[-1]
+    )
+
+    assert result.positions[-1] == 0
+
+
+def test_forced_liquidation_has_end_of_data_exit_reason() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            110.0,
+            120.0,
+        ],
+        closes=[
+            100.0,
+            115.0,
+            125.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [1, 1, 1]
+    )
+
     result = run_backtest(
-        data,
+        open_prices,
+        close_prices,
         target_at_close,
-        no_cost_config(close_open_position_at_end=True)
+        no_cost_config(
+            close_open_position_at_end=True
+        ),
     )
 
-    assert len(result.trades) == 1
+    assert result.trades.count == 1
 
-    trade = result.trades.iloc[0]
+    # 1 = forced end-of-data liquidation.
+    assert result.trades.exit_reasons[0] == 1
 
-    assert trade["exit_reason"] == "end_of_data"
 
-
-# Validation 
-def test_empty_data_rejected() -> None:
-    data = pd.DataFrame(
-        columns=["Open", "Close"],
-        dtype=float
+def test_trade_bars_held_are_based_on_execution_bars() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+            100.0,
+        ],
     )
 
-    target_at_close = pd.Series([], index= data.index, dtype="int8")
+    target_at_close = make_target(
+        [1, 1, 1, 0, 0]
+    )
+
+    result = run_backtest(
+        open_prices,
+        close_prices,
+        target_at_close,
+        no_cost_config(),
+    )
+
+    assert result.trades.count == 1
+
+    # Entry at bar 1 and exit at bar 4.
+    assert result.trades.entry_bars[0] == 1
+    assert result.trades.exit_bars[0] == 4
+    assert result.trades.bars_held[0] == 3
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+
+def test_empty_price_arrays_rejected() -> None:
+    open_prices = np.asarray(
+        [],
+        dtype=np.float64,
+    )
+
+    close_prices = np.asarray(
+        [],
+        dtype=np.float64,
+    )
+
+    target_at_close = np.asarray(
+        [],
+        dtype=np.int8,
+    )
 
     with pytest.raises(
-        ValueError, 
-        match="data cannot be empty"
-    ): run_backtest(data, target_at_close)
+        ValueError,
+        match="price arrays cannot be empty",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
 
-def test_missing_open_rejected() -> None: 
-    index = pd.date_range(
-        "2025-01-01",
-        periods=3,
-        freq="D"
+
+def test_open_prices_must_be_numpy_array() -> None:
+    close_prices = np.asarray(
+        [100.0, 101.0],
+        dtype=np.float64,
     )
 
-    data = pd.DataFrame(
-        {
-            "Close": [100.0, 101.0, 102.0]
-        },
-        index=index,
-    )
-
-    target_at_close = pd.Series(
-        [0, 0, 0],
-        index=index, 
-        dtype="int8"
+    target_at_close = make_target(
+        [0, 0]
     )
 
     with pytest.raises(
-        ValueError, 
-        match="Missing required columns"
-    ): run_backtest(
-        data, 
-        target_at_close
+        TypeError,
+        match="open_prices must be a NumPy ndarray",
+    ):
+        run_backtest(
+            [100.0, 101.0],  # type: ignore[arg-type]
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_close_prices_must_be_numpy_array() -> None:
+    open_prices = np.asarray(
+        [100.0, 101.0],
+        dtype=np.float64,
     )
 
-def test_missing_close_rejected() -> None: 
-    data = make_data(
+    target_at_close = make_target(
+        [0, 0]
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="close_prices must be a NumPy ndarray",
+    ):
+        run_backtest(
+            open_prices,
+            [100.0, 101.0],  # type: ignore[arg-type]
+            target_at_close,
+        )
+
+
+def test_target_must_be_numpy_array() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 101.0],
+        closes=[100.0, 101.0],
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="target_at_close must be a NumPy ndarray",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            [0, 0],  # type: ignore[arg-type]
+        )
+
+
+def test_price_array_lengths_must_match() -> None:
+    open_prices = np.asarray(
+        [100.0, 101.0, 102.0],
+        dtype=np.float64,
+    )
+
+    close_prices = np.asarray(
+        [100.0, 101.0],
+        dtype=np.float64,
+    )
+
+    target_at_close = make_target(
+        [0, 0, 0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "open_prices and close_prices must "
+            "have equal length"
+        ),
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_target_length_must_match_price_arrays() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 101.0, 102.0],
+        closes=[100.0, 101.0, 102.0],
+    )
+
+    target_at_close = make_target(
+        [0, 0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "target_at_close must have the same "
+            "length as the price arrays"
+        ),
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_nonpositive_open_price_rejected() -> None:
+    open_prices, close_prices = make_prices(
         opens=[100.0, 0.0, 100.0],
         closes=[100.0, 100.0, 100.0],
     )
-    
-    target_at_close = make_target(data, [0, 0, 0])
+
+    target_at_close = make_target(
+        [0, 0, 0]
+    )
 
     with pytest.raises(
-        ValueError, 
-        match= "Open and Close prices must be greater than zero",
-    ): run_backtest(
-        data,
-        target_at_close,
+        ValueError,
+        match="open_prices must be greater than zero",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_nonpositive_close_price_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 100.0, 100.0],
+        closes=[100.0, -5.0, 100.0],
     )
 
-def test_negative_or_zero_prices_rejected() -> None:
-    data = make_data(
-        opens=[100.0, -5.0, 100.0],
-        closes=[100.0, 100.0, 100.0],
+    target_at_close = make_target(
+        [0, 0, 0]
     )
-    
-    target_at_close = make_target(data, [0, 0, 0])
-
-    with pytest.raises(
-        ValueError, 
-        match= "Open and Close prices must be greater than zero",
-    ): run_backtest(
-        data,
-        target_at_close,
-    )
-
-def test_nan_prices_rejected() -> None:
-    data = make_data(
-        opens=[100.0, float("nan"), 100.0],
-        closes=[100.0, 105.0, 115.0],
-    )
-    
-    target_at_close = make_target(data, [0, 0, 0])
 
     with pytest.raises(
-        ValueError, 
-        match= "Open and Close prices cannot contain NaN values",
-    ): run_backtest(
-        data,
-        target_at_close,
+        ValueError,
+        match="close_prices must be greater than zero",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_nan_open_price_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            float("nan"),
+            100.0,
+        ],
+        closes=[
+            100.0,
+            105.0,
+            115.0,
+        ],
     )
+
+    target_at_close = make_target(
+        [0, 0, 0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "open_prices must contain only "
+            "finite values"
+        ),
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_infinite_close_price_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[
+            100.0,
+            100.0,
+            100.0,
+        ],
+        closes=[
+            100.0,
+            float("inf"),
+            100.0,
+        ],
+    )
+
+    target_at_close = make_target(
+        [0, 0, 0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "close_prices must contain only "
+            "finite values"
+        ),
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
 
 def test_invalid_target_rejected() -> None:
-    data = make_data(
-        opens=[100.0, 101.0, 102.0],
-        closes=[100.0, 101.0, 102.0],
-    )
-    
-    target_at_close = make_target(data, [0, 2, 0])
-
-    with pytest.raises(
-        ValueError, 
-        match= "target_at_close may contain only 0 or 1",
-    ): run_backtest(
-        data,
-        target_at_close,
-    )
-
-def test_target_or_data_index_mismatch_rejected() -> None:
-    data = make_data(
+    open_prices, close_prices = make_prices(
         opens=[100.0, 101.0, 102.0],
         closes=[100.0, 101.0, 102.0],
     )
 
-    wrong_index = pd.date_range(
-        "2030-01-01",
-        periods=3,
-        freq="D"
+    target_at_close = make_target(
+        [0, 2, 0]
     )
-    
-    target_at_close = pd.Series([0, 1, 1], index=wrong_index, dtype="int8")
 
     with pytest.raises(
-        ValueError, 
-        match= "target_at_close index must exactly match data index",
-    ): run_backtest(
-        data,
-        target_at_close,
+        ValueError,
+        match="target_at_close may contain only 0 or 1",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_multidimensional_open_prices_rejected() -> None:
+    open_prices = np.asarray(
+        [
+            [100.0, 101.0],
+        ],
+        dtype=np.float64,
     )
+
+    close_prices = np.asarray(
+        [100.0, 101.0],
+        dtype=np.float64,
+    )
+
+    target_at_close = make_target(
+        [0, 0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="open_prices must be one-dimensional",
+    ):
+        run_backtest(
+            open_prices,  # type: ignore[arg-type]
+            close_prices,
+            target_at_close,
+        )
+
+
+def test_multidimensional_target_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0, 101.0],
+        closes=[100.0, 101.0],
+    )
+
+    target_at_close = np.asarray(
+        [
+            [0, 1],
+        ],
+        dtype=np.int8,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="target_at_close must be one-dimensional",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,  # type: ignore[arg-type]
+        )
+
+
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
+
+def test_nonpositive_initial_cash_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0],
+        closes=[100.0],
+    )
+
+    target_at_close = make_target(
+        [0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="initial_cash must be greater than zero",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+            BacktestConfig(
+                initial_cash=0.0,
+            ),
+        )
+
+
+def test_negative_commission_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0],
+        closes=[100.0],
+    )
+
+    target_at_close = make_target(
+        [0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="commission_rate cannot be negative",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+            BacktestConfig(
+                commission_rate=-0.001,
+            ),
+        )
+
+
+def test_negative_slippage_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0],
+        closes=[100.0],
+    )
+
+    target_at_close = make_target(
+        [0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="slippage_rate cannot be negative",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+            BacktestConfig(
+                slippage_rate=-0.001,
+            ),
+        )
+
+
+def test_slippage_of_one_or_more_rejected() -> None:
+    open_prices, close_prices = make_prices(
+        opens=[100.0],
+        closes=[100.0],
+    )
+
+    target_at_close = make_target(
+        [0]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="slippage_rate must be less than 1",
+    ):
+        run_backtest(
+            open_prices,
+            close_prices,
+            target_at_close,
+            BacktestConfig(
+                slippage_rate=1.0,
+            ),
+        )
